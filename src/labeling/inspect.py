@@ -1,0 +1,516 @@
+"""Full-tile inspection overlays for the recall-audit tab."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+
+import cv2
+import numpy as np
+import pandas as pd
+
+from src.config import cfg_get
+from src.io.tile_loader import DEFAULT_FILENAME_PATTERN, parse_tile_filename
+from src.labeling.crops import (
+    CIRCLE_COLOR,
+    CIRCLE_THICKNESS,
+    DEFAULT_WAFER_FOLDER,
+    MIN_CIRCLE_RADIUS,
+    MIN_HALF_PX,
+    WINDOW_SCALE,
+    draw_particle_circle,
+    find_tile_path,
+    global_nm_to_local_px,
+    placement_for_tile,
+)
+from src.labeling.queue import detection_key, tagged_if_needed
+from src.report.report_generator import _to_display_rgb
+from src.stitching.stitcher import TilePlacement
+
+LABEL_CIRCLE_COLORS: dict[str, tuple[int, int, int]] = {
+    "particle": (40, 180, 70),
+    "not_particle": (255, 40, 40),
+    "not_sure": (60, 140, 220),
+}
+UNLABELED_CIRCLE_COLOR = CIRCLE_COLOR
+OVERVIEW_MAX_SIDE = 960
+ZOOM_MAX_SIDE = 1080
+INSPECT_DISPLAY_WIDTH = 960
+GRID_N = 3
+CELL_NAMES = (
+    ("NW", "N", "NE"),
+    ("W", "C", "E"),
+    ("SW", "S", "SE"),
+)
+MISS_SOURCE = "tile_inspect"
+DEFAULT_MISS_SIZE_UM = 15.0
+
+
+@dataclass(frozen=True)
+class OverlayView:
+    """Displayed RGB plus the transform back to tile-local pixels."""
+
+    rgb: np.ndarray
+    crop_x0: int
+    crop_y0: int
+    scale: float
+
+
+def cell_bounds(
+    height: int,
+    width: int,
+    row: int,
+    col: int,
+    grid: int = GRID_N,
+) -> tuple[int, int, int, int]:
+    """Return ``(y0, x0, y1, x1)`` for one cell of a ``grid`` × ``grid`` split."""
+    if grid < 1:
+        raise ValueError("grid must be >= 1")
+    y0 = int(height * row / grid)
+    x0 = int(width * col / grid)
+    y1 = int(height * (row + 1) / grid)
+    x1 = int(width * (col + 1) / grid)
+    return y0, x0, max(y1, y0 + 1), max(x1, x0 + 1)
+
+
+def detections_on_tile(table: pd.DataFrame | None, tile_name: str) -> pd.DataFrame:
+    """Rows whose ``source_tile`` basename matches ``tile_name``."""
+    if table is None or table.empty:
+        return pd.DataFrame()
+    name = str(tile_name)
+    names = table["source_tile"].astype(str).map(_basename)
+    return table.loc[names == name].reset_index(drop=True)
+
+
+def labeled_detections(
+    detections: pd.DataFrame | None,
+    labels: pd.DataFrame | None,
+    label: str = "particle",
+) -> pd.DataFrame:
+    """Detections whose keys are stored with ``label`` (default: particle)."""
+    if detections is None or detections.empty or labels is None or labels.empty:
+        return pd.DataFrame()
+    tagged = tagged_if_needed(detections)
+    labeled = labels.loc[labels["label"].astype(str) == str(label)].copy()
+    if labeled.empty or "key" not in tagged.columns:
+        return pd.DataFrame()
+    labeled["key"] = labeled["key"].astype(str)
+    hits = tagged.loc[tagged["key"].astype(str).isin(set(labeled["key"]))].copy()
+    if hits.empty:
+        return hits.reset_index(drop=True)
+    extra_cols = [col for col in ("key", "crop_path", "particle_id") if col in labeled.columns]
+    extra = labeled.loc[:, extra_cols].drop_duplicates("key")
+    hits["key"] = hits["key"].astype(str)
+    return hits.merge(extra, on="key", how="left", suffixes=("", "_label")).reset_index(drop=True)
+
+
+def last_run_class_counts(
+    detections: pd.DataFrame | None,
+    labels: pd.DataFrame | None,
+    tile_names: Sequence[str] | None = None,
+) -> dict[str, int]:
+    """Last-run detection totals split by label, plus missed inspect marks.
+
+    * ``n_detected`` — every last-run hit
+    * ``n_real`` — of those hits, labeled particle (green)
+    * ``n_fake`` — of those hits, labeled not-particle (red)
+    * ``n_unlabeled`` — hits with no label (orange)
+    * ``n_undetected`` — ``tile_inspect`` particle marks on these tiles whose
+      keys are not in the last run
+    * ``n_real_total`` — green circles only (same as ``n_real``)
+    """
+    empty = {
+        "n_detected": 0,
+        "n_real": 0,
+        "n_fake": 0,
+        "n_unlabeled": 0,
+        "n_undetected": 0,
+        "n_not_sure": 0,
+        "n_real_total": 0,
+    }
+    tagged = tagged_if_needed(detections) if detections is not None else pd.DataFrame()
+    if tile_names is not None and not tagged.empty:
+        wanted = {_basename(name) for name in tile_names}
+        tile = tagged["source_tile"].astype(str).map(_basename)
+        tagged = tagged.loc[tile.isin(wanted)]
+    n_detected = int(len(tagged)) if tagged is not None and not tagged.empty else 0
+    label_map: dict[str, str] = {}
+    particles = pd.DataFrame()
+    if labels is not None and not labels.empty:
+        for record in labels.to_dict(orient="records"):
+            label_map[str(record["key"])] = str(record["label"])
+        particles = labels.loc[labels["label"].astype(str) == "particle"].copy()
+        if tile_names is not None and not particles.empty:
+            wanted = {_basename(name) for name in tile_names}
+            tile = particles["source_tile"].astype(str).map(_basename)
+            particles = particles.loc[tile.isin(wanted)]
+
+    n_real = n_fake = n_not_sure = n_unlabeled = 0
+    det_keys: set[str] = set()
+    if n_detected and "key" in tagged.columns:
+        for key in tagged["key"].astype(str):
+            det_keys.add(str(key))
+            name = label_map.get(str(key), "")
+            if name == "particle":
+                n_real += 1
+            elif name == "not_particle":
+                n_fake += 1
+            elif name == "not_sure":
+                n_not_sure += 1
+            else:
+                n_unlabeled += 1
+    n_undetected = 0
+    if not particles.empty and "source_csv" in particles.columns:
+        inspect = particles.loc[particles["source_csv"].astype(str) == MISS_SOURCE]
+        n_undetected = int((~inspect["key"].astype(str).isin(det_keys)).sum())
+    return {
+        "n_detected": n_detected,
+        "n_real": n_real,
+        "n_fake": n_fake,
+        "n_unlabeled": n_unlabeled,
+        "n_undetected": n_undetected,
+        "n_not_sure": n_not_sure,
+        "n_real_total": n_real,
+    }
+
+
+def labeled_particle_recovery(
+    detections: pd.DataFrame | None,
+    labels: pd.DataFrame | None,
+    tile_names: Sequence[str] | None = None,
+    near_px: float = 20.0,
+    pixel_size_nm: float = 960.0,
+) -> dict[str, float]:
+    """Labeled particles among last-run detections (green circles).
+
+    Only keys that appear in ``detections`` are counted, so labels from older
+    pipeline CSVs that this run did not emit are ignored.
+    """
+    _ = (near_px, pixel_size_nm)
+    empty = {"n_labeled": 0, "n_found": 0, "pct": 0.0}
+    hits = labeled_detections(detections, labels, label="particle")
+    if hits.empty:
+        return empty
+    if tile_names is not None:
+        wanted = {_basename(name) for name in tile_names}
+        tile = hits["source_tile"].astype(str).map(_basename)
+        hits = hits.loc[tile.isin(wanted)]
+    if hits.empty:
+        return empty
+    n = int(hits["key"].astype(str).nunique()) if "key" in hits.columns else int(len(hits))
+    return {"n_labeled": n, "n_found": n, "pct": 100.0}
+
+
+def tile_names_for_hits(hits: pd.DataFrame | None) -> list[str]:
+    """Unique ``source_tile`` basenames, first-seen order."""
+    if hits is None or hits.empty or "source_tile" not in hits.columns:
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+    for name in hits["source_tile"].astype(str).map(_basename):
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+def label_color_for_key(key: str, labels: Mapping[str, str]) -> tuple[int, int, int]:
+    name = labels.get(str(key))
+    if name in LABEL_CIRCLE_COLORS:
+        return LABEL_CIRCLE_COLORS[name]
+    return UNLABELED_CIRCLE_COLOR
+
+
+def overlay_view(
+    image: np.ndarray,
+    circles: Sequence[Mapping[str, Any]],
+    pixel_size_nm: float,
+    *,
+    crop: tuple[int, int, int, int] | None = None,
+    max_side: int | None = OVERVIEW_MAX_SIDE,
+) -> OverlayView:
+    """Contrast-stretch ``image``, optional crop, downsample, draw circles."""
+    gray = np.asarray(image)
+    if crop is not None:
+        y0, x0, y1, x1 = crop
+        gray = gray[y0:y1, x0:x1]
+        crop_x0, crop_y0 = int(x0), int(y0)
+    else:
+        crop_x0, crop_y0 = 0, 0
+    rgb = _to_display_rgb(gray)
+    if rgb.size == 0:
+        return OverlayView(rgb=rgb, crop_x0=crop_x0, crop_y0=crop_y0, scale=1.0)
+    height, width = int(rgb.shape[0]), int(rgb.shape[1])
+    scale = 1.0
+    if max_side is not None and max(height, width) > int(max_side):
+        scale = float(max_side) / float(max(height, width))
+        new_w = max(1, int(round(width * scale)))
+        new_h = max(1, int(round(height * scale)))
+        rgb = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    out = np.ascontiguousarray(rgb).copy()
+    for circle in circles:
+        color = tuple(int(c) for c in circle.get("color", UNLABELED_CIRCLE_COLOR))
+        x_s = (float(circle["x_local"]) - crop_x0) * scale
+        y_s = (float(circle["y_local"]) - crop_y0) * scale
+        size_nm = float(circle["size"])
+        pixel = float(pixel_size_nm) if pixel_size_nm > 0 else 1.0
+        radius = max(
+            int(round(size_nm / pixel / 2.0 * scale)) + 10,
+            MIN_CIRCLE_RADIUS,
+        )
+        x_d = int(round(x_s))
+        y_d = int(round(y_s))
+        if out.size == 0:
+            continue
+        if not (0 <= x_d < out.shape[1] and 0 <= y_d < out.shape[0]):
+            continue
+        cv2.circle(
+            out,
+            (x_d, y_d),
+            radius,
+            color,
+            thickness=max(CIRCLE_THICKNESS, 3),
+            lineType=cv2.LINE_AA,
+        )
+    return OverlayView(rgb=out, crop_x0=crop_x0, crop_y0=crop_y0, scale=scale)
+
+
+def overlay_circles(
+    image: np.ndarray,
+    circles: Sequence[Mapping[str, Any]],
+    pixel_size_nm: float,
+    *,
+    crop: tuple[int, int, int, int] | None = None,
+    max_side: int | None = OVERVIEW_MAX_SIDE,
+) -> np.ndarray:
+    """RGB overlay used by tests and callers that only need the image."""
+    return overlay_view(
+        image, circles, pixel_size_nm, crop=crop, max_side=max_side
+    ).rgb
+
+
+def local_xy_on_tile(
+    x_global: float,
+    y_global: float,
+    placements: Sequence[TilePlacement],
+    pixel_size_nm: float,
+    width: int,
+    height: int,
+) -> tuple[float, float]:
+    """Map globals to tile pixels using the first placement that lands in-frame.
+
+    Detector CSVs use the full R3 mosaic origin. Click-marks from a 6-tile
+    folder use that folder's origin. Trying both keeps circles on the image.
+    """
+    if not placements:
+        raise ValueError("placements must not be empty")
+    fallback = global_nm_to_local_px(
+        x_global, y_global, placements[0], pixel_size_nm
+    )
+    for placement in placements:
+        x_local, y_local = global_nm_to_local_px(
+            x_global, y_global, placement, pixel_size_nm
+        )
+        if 0.0 <= x_local < float(width) and 0.0 <= y_local < float(height):
+            return x_local, y_local
+    return fallback
+
+
+def extra_grid_placements(base: TilePlacement, config: Mapping[str, Any]) -> list[TilePlacement]:
+    """Placements for last-run CSVs that used the full R3 grid, not the sidebar folder."""
+    pattern = str(cfg_get(dict(config), "filename_pattern", DEFAULT_FILENAME_PATTERN))
+    try:
+        meta = parse_tile_filename(base.name, pattern)
+    except ValueError:
+        return []
+    if "row" not in meta or "col" not in meta:
+        return []
+    row = int(meta["row"])
+    col = int(meta["col"])
+    configured = float(cfg_get(dict(config), "overlap_fraction", 0.0) or 0.0)
+    overlaps: list[float] = []
+    for overlap in (configured, 0.0, 0.1):
+        if overlap not in overlaps:
+            overlaps.append(float(overlap))
+    placements: list[TilePlacement] = []
+    seen: set[tuple[int, int]] = set()
+    for overlap in overlaps:
+        step_x = float(base.width) * (1.0 - overlap)
+        step_y = float(base.height) * (1.0 - overlap)
+        for row_origin, col_origin in ((1, 1), (0, 0)):
+            x0 = int(round((col - col_origin) * step_x))
+            y0 = int(round((row - row_origin) * step_y))
+            key = (x0, y0)
+            if key in seen:
+                continue
+            seen.add(key)
+            placements.append(
+                TilePlacement(
+                    path=base.path,
+                    name=base.name,
+                    y0=y0,
+                    x0=x0,
+                    height=base.height,
+                    width=base.width,
+                )
+            )
+    return placements
+
+
+def candidate_placements(
+    tile_path: Any,
+    config: Mapping[str, Any],
+    mosaic: Any | None = None,
+    origin_cache: dict[str, tuple[int, int]] | None = None,
+) -> list[TilePlacement]:
+    """Current-folder placement, full-wafer grid, R3 04-08, then origin (0, 0)."""
+    path = Path(tile_path)
+    primary = placement_for_tile(
+        path, dict(config), mosaic=mosaic, origin_cache=origin_cache
+    )
+    ordered = [primary]
+    seen = {(int(primary.x0), int(primary.y0))}
+    for extra in extra_grid_placements(primary, config):
+        key = (int(extra.x0), int(extra.y0))
+        if key not in seen:
+            ordered.append(extra)
+            seen.add(key)
+    try:
+        wafer_path = find_tile_path(path.name, input_dir=DEFAULT_WAFER_FOLDER)
+        wafer_config = dict(config)
+        wafer_config["input_dir"] = DEFAULT_WAFER_FOLDER
+        wafer = placement_for_tile(
+            wafer_path, wafer_config, mosaic=None, origin_cache=origin_cache
+        )
+        key = (int(wafer.x0), int(wafer.y0))
+        if key not in seen:
+            ordered.append(wafer)
+            seen.add(key)
+    except (FileNotFoundError, ValueError, OSError):
+        pass
+    if (0, 0) not in seen:
+        ordered.append(
+            TilePlacement(
+                path=primary.path,
+                name=primary.name,
+                y0=0,
+                x0=0,
+                height=primary.height,
+                width=primary.width,
+            )
+        )
+    return ordered
+
+
+def display_xy_to_local(
+    x_display: float,
+    y_display: float,
+    view: OverlayView,
+) -> tuple[float, float]:
+    """Map a click on the displayed overlay back to tile-local pixels."""
+    scale = float(view.scale) if float(view.scale) > 0 else 1.0
+    x_local = float(view.crop_x0) + float(x_display) / scale
+    y_local = float(view.crop_y0) + float(y_display) / scale
+    return x_local, y_local
+
+
+def missed_particle_record(
+    tile_name: str,
+    x_global: float,
+    y_global: float,
+    size_nm: float,
+) -> dict[str, Any]:
+    """CSV row for a click that was not a detector hit."""
+    record: dict[str, Any] = {
+        "id": "",
+        "source_tile": str(tile_name),
+        "x_global": float(x_global),
+        "y_global": float(y_global),
+        "size": float(size_nm),
+        "confidence": 0.0,
+        "source_csv": MISS_SOURCE,
+    }
+    record["key"] = detection_key(record)
+    return record
+
+
+def preview_click_crop(
+    image: np.ndarray,
+    x_local: float,
+    y_local: float,
+    size_nm: float,
+    pixel_size_nm: float,
+    color: tuple[int, int, int] | None = None,
+) -> np.ndarray:
+    """Full-res crop around a hit, padded so the circle is not clipped."""
+    scale = float(pixel_size_nm) if pixel_size_nm > 0 else 1.0
+    diameter_px = float(size_nm) / scale
+    radius = max(int(round(diameter_px / 2.0)) + 10, MIN_CIRCLE_RADIUS)
+    half = max(
+        int(MIN_HALF_PX),
+        int(round(float(WINDOW_SCALE) * float(diameter_px))),
+        int(radius + CIRCLE_THICKNESS + 24),
+    )
+    height, width = int(image.shape[0]), int(image.shape[1])
+    cx = int(round(float(x_local)))
+    cy = int(round(float(y_local)))
+    x0, y0 = cx - half, cy - half
+    x1, y1 = cx + half, cy + half
+    pad_left = max(0, -x0)
+    pad_top = max(0, -y0)
+    pad_right = max(0, x1 - width)
+    pad_bottom = max(0, y1 - height)
+    y0c, x0c = max(0, y0), max(0, x0)
+    y1c, x1c = min(height, y1), min(width, x1)
+    patch = np.asarray(image[y0c:y1c, x0c:x1c])
+    if pad_top or pad_bottom or pad_left or pad_right:
+        patch = cv2.copyMakeBorder(
+            patch,
+            pad_top,
+            pad_bottom,
+            pad_left,
+            pad_right,
+            cv2.BORDER_REFLECT_101,
+        )
+    rgb = _to_display_rgb(patch)
+    draw_particle_circle(
+        rgb,
+        x_local,
+        y_local,
+        size_nm,
+        pixel_size_nm,
+        crop_x0=x0,
+        crop_y0=y0,
+        color=LABEL_CIRCLE_COLORS["particle"] if color is None else color,
+    )
+    return rgb
+
+
+def circles_from_rows(
+    rows: pd.DataFrame,
+    x_locals: Sequence[float],
+    y_locals: Sequence[float],
+    labels: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    """Build overlay circle dicts, tagging each row with its label colour."""
+    circles: list[dict[str, Any]] = []
+    for (x_local, y_local), (_, row) in zip(
+        zip(x_locals, y_locals, strict=True), rows.iterrows(), strict=True
+    ):
+        key = str(row["key"]) if "key" in row and pd.notna(row["key"]) else detection_key(row)
+        circles.append(
+            {
+                "x_local": float(x_local),
+                "y_local": float(y_local),
+                "size": float(row["size"]),
+                "color": label_color_for_key(key, labels),
+                "key": key,
+            }
+        )
+    return circles
+
+
+def _basename(path: str) -> str:
+    text = str(path).replace("\\", "/")
+    return text.rsplit("/", 1)[-1]

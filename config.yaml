@@ -1,0 +1,116 @@
+input_dir: "Recall audit less dirty"
+output_dir: "../Outputs/Recall audit less dirty fn"
+# R{run}_{row}_{col}_{mag}X.tif  e.g. R3_5_32_5X.tif
+filename_pattern: 'R(?P<run>\d+)_(?P<row>\d+)_(?P<col>\d+)_(?P<mag>[\d.]+)X\.tiff?'
+run: ""
+magnification: ""
+overlap_fraction: 0.0
+# 1 pixel = 0.96 µm on the 5X tiles.
+pixel_size_nm: 960.0
+
+pipeline:
+  workers: 0
+
+preprocessing:
+  denoise: true
+  denoise_sigma: 1.0
+  contrast_stretch: true
+  contrast_percentiles: [1.0, 99.0]
+  flatten_illumination: true
+  flatten_sigma: 160.0
+
+detection:
+  method: fft
+  particles_bright: true
+  fft_peak_threshold: 0.35
+  fft_notch_radius: 3
+  # per_tile: notch each tile from its own spectrum. shared: reuse paths[0].
+  fft_mask: per_tile
+  tophat_radius: 50
+  # 0.96 µm/px: 10 µm ≈ 10.4 px (DoG sigma ≈ 3.7). Sigma 36 ≈ 100 µm.
+  # Top-hat radius must exceed the largest particle or flakes are erased.
+  blob_method: dog
+  min_size_nm: 10000.0
+  max_size_nm: 100000.0
+  # Reported size is ECD on the photo: pixels that stand out from the
+  # local background by this fraction of (peak - background).
+  size_mass_fraction: 0.4
+  blob_min_sigma: 3.7
+  blob_max_sigma: 36.0
+  blob_num_sigma: 5
+  blob_sigma_ratio: 1.4
+  blob_threshold: 0.08
+  min_area_px: 4
+  # Drop residual below this (after 0–1 scaling) before DoG. Keeps bright
+  # specks; stops dark-field noise from cluster-killing them.
+  # Compact residual islands on a layout ridge: ≥40 µm always; ≥20 µm only
+  # if the ridge is a single edge (not a pad-corner L-junction).
+  island_min_nm: 20000.0
+  island_large_nm: 40000.0
+  island_max_aspect: 3.0
+  island_min_solidity: 0.35
+  island_open_px: 4
+  # Drop blobs whose residual-at-peak (confidence, 0–1) is below this.
+  min_confidence: 0.95
+  # High-recall proposal stage for the ML cascade. Strict classical gates stay
+  # the default. When true, the recall overlay is applied (rim debris can pass;
+  # FFT/DoG and the size window are unchanged). Cluster/line filters stay on.
+  recall_mode: true
+  recall:
+    edge_exclude_px: 12.0
+    min_confidence: 0.40  # 4 true misses sat at 0.44–0.58; 0.75 dropped them
+    min_circularity: 0.0
+    # Keep cluster/grid rejection on. 0 here caused tens of thousands of lattice hits.
+    structure_min_neighbors: 2
+    structure_line_bin_px: 10.0
+  # 0 = auto (3.5 × blob_max_sigma). Local energy envelope for SNR scaling.
+  local_snr_sigma: 0.0
+  edge_soften_sigma: 12.0
+  edge_soften_strength: 2.0
+  # Dead zone around area borders (px). Stops DoG from beading just inside boxes.
+  # Hits on the border ridge itself (pad corners) are always dropped.
+  edge_exclude_px: 48.0
+  # Ignore compact gradient rings; keep only borders at least this long.
+  edge_min_length_px: 40.0
+  # Inertia-ratio circularity; 0 disables. Low floor: labeled debris is
+  # irregular; letters/fiducials are often rounder.
+  min_circularity: 0.30
+  # Drop blobs that have this many neighbors within structure_neighbor_px (chains/grids).
+  structure_neighbor_px: 48.0
+  structure_min_neighbors: 2
+  # Keep a clustered blob if it is this × the median neighbor size (layout beads).
+  structure_size_ratio: 1.30
+  # Drop long horizontal/vertical rows of blobs (remaining box frames). 0 disables.
+  structure_line_bin_px: 10.0
+  structure_line_min_run: 3
+  structure_line_min_span_px: 48.0
+  # A row is not a frame if it has a hole larger than this (px). Stops two
+  # unrelated flakes in the same 10 px band from axis-killing each other.
+  structure_line_max_gap_px: 48.0
+
+measurement:
+  merge_radius_px: 8.0
+  size_aggregation: max
+
+# Optional post-filter on DoG hits. Off until models/particle_clf.joblib exists.
+# Train with `python -m src.ml.train` (unmarked TIFF/residual crops, not circled JPEGs).
+ml:
+  enabled: true
+  model_path: models/particle_clf.joblib
+  threshold: 0.0
+  # Score gated DoG hits before cluster/line filters, then apply those filters
+  # to ML survivors. Off: classical cluster/line first (default). On can add
+  # lattice neighbors that cluster-kill isolated flakes. Cluster stays on either way.
+  score_before_structure: false
+  # Cascade CNN band is stored in the trained joblib. These are fallbacks only.
+  band_low: 0.20
+  band_high: 0.80
+
+# Label tab prefers this particles.csv (under Outputs/) then falls back.
+labeling:
+  source_csv: recall/particles.csv
+
+report:
+  # 0 = pick a factor so the full RGB stitch is about target_mb.
+  downsample: 0
+  target_mb: 20.0
