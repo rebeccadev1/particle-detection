@@ -12,12 +12,13 @@ from src.config import cfg_get, resolve_output_dir
 from src.io.tile_loader import DEFAULT_FILENAME_PATTERN, matching_tile_paths
 from src.labeling.crops import (
     TileImageCache,
+    crop_direction_views,
     crop_particle,
     find_tile_path,
     local_px_to_global_nm,
     placement_for_tile,
 )
-from src.labeling.audit_misses import format_trace_caption, input_tile_names, trace_click
+from src.labeling.audit_misses import input_tile_names
 from src.labeling.inspect import (
     CELL_NAMES,
     DEFAULT_MISS_SIZE_UM,
@@ -30,22 +31,35 @@ from src.labeling.inspect import (
     circles_from_rows,
     detections_on_tile,
     display_xy_to_local,
+    expand_direction_tile_names,
+    unhappiness_score,
     label_color_for_key,
     labeled_particle_recovery,
     last_run_class_counts,
+    last_run_class_counts_by_tile,
     local_xy_on_tile,
     missed_particle_record,
     overlay_view,
     preview_click_crop,
+    related_scene_tile_names,
     tile_names_for_hits,
+    undetected_size_floor_nm,
 )
 from src.labeling.queue import (
+    expand_labeled_keys,
     last_run_csv,
     load_last_pipeline,
     load_particles_csv,
+    label_map_with_aliases,
     merge_detection_tables,
     tag_table,
     unlabeled_queue,
+    snap_detection_keys_to_labels,
+)
+from src.measurement.measurer import (
+    DEFAULT_NSEW_MERGE_RADIUS_PX,
+    DEFAULT_NSEW_SIZE_MATCH_FRACTION,
+    is_nsew_family_tile,
 )
 from src.labeling.store import LabelStore
 from src.stitching.stitcher import LazyMosaic
@@ -59,10 +73,52 @@ NM_PER_UM = 1000.0
 GALLERY_PAGE_SIZE = 24
 LABEL_IMAGE_WIDTH = 420
 GALLERY_IMAGE_WIDTH = 180
+LAST_RUN_OVERVIEW_WIDTH = 720
+LAST_RUN_CROP_COLUMNS = 4
 
 
 def labels_store(project_root: str | Path) -> LabelStore:
     return LabelStore(Path(project_root) / "labels")
+
+
+def _nsew_merge_radius_nm(config: dict[str, Any]) -> float:
+    pixel_size = float(cfg_get(config, "pixel_size_nm", 960.0))
+    merge_px = float(
+        cfg_get(
+            config,
+            "measurement.nsew_merge_radius_px",
+            DEFAULT_NSEW_MERGE_RADIUS_PX,
+        )
+    )
+    return merge_px * pixel_size
+
+
+def _nsew_size_match_fraction(config: dict[str, Any]) -> float:
+    return float(
+        cfg_get(
+            config,
+            "measurement.nsew_size_match_fraction",
+            DEFAULT_NSEW_SIZE_MATCH_FRACTION,
+        )
+    )
+
+
+def _labels_for_scene(
+    labels_df: pd.DataFrame,
+    config: dict[str, Any],
+    extra_tiles: list[str] | None = None,
+) -> pd.DataFrame:
+    if labels_df is None or labels_df.empty:
+        return labels_df
+    scene = related_scene_tile_names(
+        cfg_get(config, "input_dir", None), extra_tiles
+    )
+    if not scene:
+        return labels_df
+    tile = labels_df["source_tile"].astype(str).map(
+        lambda path: str(path).replace("\\", "/").rsplit("/", 1)[-1]
+    )
+    return labels_df.loc[tile.isin(scene)].copy()
 
 
 def render_label_tab(
@@ -80,7 +136,8 @@ def render_label_tab(
     st.caption(
         "Right = particle · Down = not sure · Left = not a particle · Up = undo. "
         "Load last run queues Detection → Run pipeline output "
-        "(the latest output folder), skipping already-labeled keys."
+        "(the latest output folder), skipping already-labeled keys. "
+        "Labeling N, W, E, S, or a particles-only version labels the same location on all of them."
     )
 
     pipeline_csv, pipeline_config = load_last_pipeline(config)
@@ -106,7 +163,16 @@ def render_label_tab(
         crop_config = config
         tables = _detection_tables(project_root, table, config)
     n_hits = sum(len(frame) for frame in tables)
-    queue = unlabeled_queue(tables, store.labeled_keys())
+    radius_nm = _nsew_merge_radius_nm(crop_config)
+    size_frac = _nsew_size_match_fraction(crop_config)
+    scene_labels = _labels_for_scene(store.load(), crop_config)
+    queue = unlabeled_queue(
+        tables,
+        scene_labels["key"] if scene_labels is not None and not scene_labels.empty else store.labeled_keys(),
+        nsew_merge_radius_nm=radius_nm,
+        nsew_size_match_fraction=size_frac,
+        labels=scene_labels,
+    )
     front = st.session_state.get("label_front_key")
     if front is not None and not queue.empty:
         match = queue["key"].astype(str) == str(front)
@@ -137,28 +203,56 @@ def render_label_tab(
 
     current = queue.iloc[0]
     try:
-        crop = crop_particle(
+        views = crop_direction_views(
             current,
             crop_config,
             mosaic=mosaic,
             cache=cache,
             origin_cache=origin_cache,
         )
+        if views:
+            crop = views.get(
+                Path(str(current["source_tile"])).stem.upper(),
+                next(iter(views.values())),
+            )
+        else:
+            crop = crop_particle(
+                current,
+                crop_config,
+                mosaic=mosaic,
+                cache=cache,
+                origin_cache=origin_cache,
+            )
     except (FileNotFoundError, ValueError, OSError) as exc:
         st.error(str(exc))
         _undo_row(store, counts)
         return
 
     size_um = float(current["size"]) / NM_PER_UM
-    image_col, _ = st.columns([LABEL_IMAGE_WIDTH, 800])
-    image_col.image(
-        crop.rgb,
-        caption=(
-            f"id {current.get('id', '')} · {current['source_tile']} · "
-            f"{size_um:.2f} µm · confidence {float(current.get('confidence', 0.0)):.3f}"
-        ),
-        width=LABEL_IMAGE_WIDTH,
-    )
+    if views:
+        cols = st.columns(len(views))
+        for column, (direction, view) in zip(cols, views.items()):
+            column.image(
+                view.rgb,
+                caption=f"{direction} · {view.tile_path.name}",
+                width="stretch",
+            )
+        dirs = ", ".join(views)
+        st.caption(
+            f"id {current.get('id', '')} · {size_um:.2f} µm · "
+            f"confidence {float(current.get('confidence', 0.0)):.3f} · "
+            f"same location on {dirs} (one label for all)"
+        )
+    else:
+        image_col, _ = st.columns([LABEL_IMAGE_WIDTH, 800])
+        image_col.image(
+            crop.rgb,
+            caption=(
+                f"id {current.get('id', '')} · {current['source_tile']} · "
+                f"{size_um:.2f} µm · confidence {float(current.get('confidence', 0.0)):.3f}"
+            ),
+            width=LABEL_IMAGE_WIDTH,
+        )
     st.caption(f"Reviewing 1 of {remaining} remaining in the unlabeled queue.")
 
     cols = st.columns(4)
@@ -206,7 +300,7 @@ def _on_load_last_pipeline() -> None:
 
 
 def _advance_inspect_tile(delta: int) -> None:
-    """Move to the previous/next TIFF. Must run in a button callback (before widgets)."""
+    """Move to the previous/next tile. Must run in a button callback (before widgets)."""
     names = list(st.session_state.get("_inspect_tile_names") or [])
     if not names:
         return
@@ -237,37 +331,64 @@ def _clear_inspect_cell() -> None:
     st.session_state.pop("inspect_click_sig", None)
 
 
+def _last_pipeline_view(
+    config: dict[str, Any],
+    table: pd.DataFrame | None,
+) -> tuple[dict[str, Any], Path | None, pd.DataFrame | None]:
+    """Folder, CSV, and detections from last_pipeline.json (not the sidebar)."""
+    last_csv, run_config = load_last_pipeline(dict(config))
+    detections: pd.DataFrame | None = None
+    if last_csv is not None and last_csv.is_file():
+        detections = load_particles_csv(last_csv)
+    elif table is not None:
+        detections = tag_table(table, last_csv)
+    return run_config, last_csv, detections
+
+
 def render_tile_inspect_tab(
     config: dict[str, Any],
     project_root: str | Path,
     table: pd.DataFrame | None,
     mosaic: LazyMosaic | None,
 ) -> None:
-    """Walk the input folder one TIFF at a time, with detection circles overlaid."""
+    """Walk the last-pipeline tile folder, with detection and label circles."""
     st.subheader("Inspect tiles")
     st.caption(
         "Green = labeled particle · red = labeled not-particle · blue = not sure · "
         "orange = unlabeled detection. Zoom a 3×3 cell, click an unmarked speck, then "
-        "Mark missed particle. Left/Right change tile."
+        "Mark missed particle. Left/Right change tile. "
+        "Same map as Last Run (not the sidebar Tile folder). "
+        "A label on N, S, E, or W is applied to all four."
     )
 
-    folder = str(cfg_get(config, "input_dir", "") or "")
-    if not folder:
-        st.info("Set a tile folder in the sidebar.")
+    try:
+        run_config, last_csv, detections = _last_pipeline_view(config, table)
+    except (ValueError, OSError) as exc:
+        st.error(str(exc))
         return
-    pattern = str(cfg_get(config, "filename_pattern", DEFAULT_FILENAME_PATTERN))
+    folder = str(cfg_get(run_config, "input_dir", "") or "")
+    if not folder:
+        st.info("Run the pipeline, or set a tile folder in the sidebar.")
+        return
+    pattern = str(cfg_get(run_config, "filename_pattern", DEFAULT_FILENAME_PATTERN))
+    source = last_csv if last_csv is not None else "sidebar"
+    st.caption(f"Map {folder} · detections {source}")
+    inspect_mosaic = mosaic
+    if str(cfg_get(config, "input_dir", "") or "") != folder:
+        inspect_mosaic = None
     try:
         paths = matching_tile_paths(
             folder,
             pattern,
-            run=cfg_get(config, "run", None),
-            magnification=cfg_get(config, "magnification", None),
+            run=cfg_get(run_config, "run", None),
+            magnification=cfg_get(run_config, "magnification", None),
+            include_unmatched=True,
         )
     except (FileNotFoundError, ValueError) as exc:
         st.error(str(exc))
         return
     if not paths:
-        st.warning(f"No matching TIFFs in {folder}.")
+        st.warning(f"No matching tiles in {folder}.")
         return
 
     names = [path.name for path in paths]
@@ -308,14 +429,24 @@ def render_tile_inspect_tab(
 
     store = labels_store(project_root)
     labels_df = store.load()
-    label_map: dict[str, str] = {}
-    if not labels_df.empty:
-        for record in labels_df.to_dict(orient="records"):
-            label_map[str(record["key"])] = str(record["label"])
+    scene_labels = _labels_for_scene(labels_df, config, names)
+    label_map = label_map_with_aliases(scene_labels)
 
-    detections = merge_detection_tables(_detection_tables(project_root, table, config))
+    if detections is None:
+        detections = pd.DataFrame()
+    else:
+        detections = snap_detection_keys_to_labels(
+            detections,
+            scene_labels,
+            _nsew_merge_radius_nm(config),
+            _nsew_size_match_fraction(config),
+        )
     tile_hits = detections_on_tile(detections, tile_name)
-    extra = _label_rows_missing_from_hits(labels_df, tile_name, tile_hits)
+    extra = _label_rows_missing_from_hits(
+        scene_labels, tile_name, tile_hits, folder_tiles=list(
+            related_scene_tile_names(cfg_get(config, "input_dir", None), names) or names
+        )
+    )
     if extra is not None and not extra.empty:
         tile_hits = pd.concat([tile_hits, extra], ignore_index=True)
 
@@ -339,16 +470,16 @@ def render_tile_inspect_tab(
         with st.spinner("Loading tile…"):
             image = cache.load(tile_path)
             placement = placement_for_tile(
-                tile_path, config, mosaic=mosaic, origin_cache=origin_cache
+                tile_path, run_config, mosaic=inspect_mosaic, origin_cache=origin_cache
             )
             placements = candidate_placements(
-                tile_path, config, mosaic=mosaic, origin_cache=origin_cache
+                tile_path, run_config, mosaic=inspect_mosaic, origin_cache=origin_cache
             )
     except (FileNotFoundError, ValueError, OSError) as exc:
         st.error(str(exc))
         return
 
-    pixel_size = float(cfg_get(config, "pixel_size_nm", 960.0))
+    pixel_size = float(cfg_get(run_config, "pixel_size_nm", 960.0))
     height, width = int(image.shape[0]), int(image.shape[1])
     x_locals: list[float] = []
     y_locals: list[float] = []
@@ -459,14 +590,6 @@ def render_tile_inspect_tab(
             pixel_size,
         )
         st.image(preview, caption="Pending mark", width=240)
-        trace = _pending_mark_trace(
-            image,
-            config,
-            tile_name,
-            float(pending["y_local"]),
-            float(pending["x_local"]),
-        )
-        st.caption(format_trace_caption(trace))
         mark_cols = st.columns(2)
         if mark_cols[0].button(
             "Mark missed particle",
@@ -498,38 +621,6 @@ def render_tile_inspect_tab(
         st.dataframe(display[keep], width="stretch", hide_index=True)
 
 
-def _pending_mark_trace(
-    image: Any,
-    config: dict[str, Any],
-    tile_name: str,
-    y_local: float,
-    x_local: float,
-) -> dict[str, Any]:
-    """Cached ``trace_click`` for the Tiles pending-mark panel."""
-    det = config.get("detection") or {}
-    fingerprint = (
-        tile_name,
-        bool(det.get("recall_mode", False)),
-        float(det.get("min_confidence", 0.0) or 0.0),
-        float(det.get("min_circularity", 0.0) or 0.0),
-        float(det.get("edge_exclude_px", 0.0) or 0.0),
-        float(det.get("min_prominence", 0.0) or 0.0),
-        int(det.get("structure_min_neighbors", 2) or 0),
-        float(cfg_get(config, "detection.min_size_nm", 0.0) or 0.0),
-    )
-    store = st.session_state.setdefault("_inspect_trace_cache", {})
-    cached = store.get("fingerprint")
-    traces = store.get("traces")
-    if cached != fingerprint or not isinstance(traces, dict):
-        traces = {}
-        store["fingerprint"] = fingerprint
-        store["traces"] = traces
-    key = (round(float(x_local), 1), round(float(y_local), 1))
-    if key not in traces:
-        traces[key] = trace_click(image, config, y_local, x_local)
-    return dict(traces[key])
-
-
 def _advance_labeled_review_tile(delta: int) -> None:
     names = list(st.session_state.get("_labeled_review_tile_names") or [])
     if not names:
@@ -539,66 +630,166 @@ def _advance_labeled_review_tile(delta: int) -> None:
     st.session_state["labeled_review_tile"] = names[(index + delta) % len(names)]
 
 
-def _last_run_stat_card(label: str, value: int, color: str, wash: str, hint: str) -> str:
+def _last_run_stat_card(label: str, value: int | str, color: str, wash: str, hint: str) -> str:
+    shown = f"{value:,}" if isinstance(value, int) else value
     return (
         "<div style='flex:1;min-width:9.5rem;padding:0.9rem 1rem;border-radius:12px;"
         f"background:{wash};border:1px solid {color}66;'>"
         f"<div style='font-size:0.78rem;font-weight:650;letter-spacing:0.04em;"
         f"text-transform:uppercase;color:{color};'>{label}</div>"
         f"<div style='font-size:1.9rem;font-weight:750;line-height:1.15;"
-        f"font-variant-numeric:tabular-nums;color:{color};'>{value:,}</div>"
+        f"font-variant-numeric:tabular-nums;color:{color};'>{shown}</div>"
         f"<div style='font-size:0.78rem;opacity:0.78;margin-top:0.15rem;'>{hint}</div>"
         "</div>"
     )
 
 
-def _render_last_run_summary(counts: dict[str, int]) -> None:
-    cards = [
+def _last_run_rate_text(value: float, *, defined: bool) -> str:
+    if not defined:
+        return "—"
+    return f"{100.0 * float(value):.1f}%"
+
+
+def _last_run_unhappiness_text(counts: dict[str, float], *, defined: bool) -> str:
+    if not defined:
+        return "—"
+    score = counts.get("unhappiness")
+    if score is None:
+        score = unhappiness_score(
+            float(counts.get("precision", 0.0)),
+            float(counts.get("recall", 0.0)),
+        )
+    return f"{float(score):.2f}%"
+
+
+def _render_last_run_summary(
+    counts: dict[str, float],
+    *,
+    min_size_nm: float = 0.0,
+) -> None:
+    floor_um = float(min_size_nm) / NM_PER_UM if min_size_nm else 20.0
+    miss_title = f"Undetected real ≥ {floor_um:.0f} µm"
+    miss_hint = "labeled particles missed at this size floor"
+    counts_row = [
         _last_run_stat_card(
-            "Detected", counts["n_detected"], "#5b6472", "#5b647214", "all last-run hits"
+            "Detected", int(counts["n_detected"]), "#5b6472", "#5b647214", "all last-run hits"
         ),
         _last_run_stat_card(
             "Real of detected",
-            counts["n_real"],
+            int(counts["n_real"]),
             "#1f9d3a",
             "#28b44622",
-            "green circles",
+            "detected and labeled particle",
         ),
         _last_run_stat_card(
             "Fake of detected",
-            counts["n_fake"],
+            int(counts["n_fake"]),
             "#d61f1f",
             "#e3262622",
-            "red circles",
+            "detected, not labeled as particle",
         ),
         _last_run_stat_card(
             "Total real",
-            counts["n_real_total"],
+            int(counts["n_real_total"]),
             "#187a2e",
             "#28b44618",
-            "green circles only",
+            f"real of detected + undetected ≥ {floor_um:.0f} µm",
         ),
         _last_run_stat_card(
-            "Undetected",
-            counts["n_undetected"],
+            miss_title,
+            int(counts["n_undetected"]),
             "#c56a00",
             "#d9770618",
-            "inspect marks missed",
+            miss_hint,
         ),
     ]
+    rates_row = [
+        _last_run_stat_card(
+            "Precision",
+            _last_run_rate_text(
+                float(counts.get("precision", 0.0)),
+                defined=int(counts["n_detected"]) > 0,
+            ),
+            "#4b5d8a",
+            "#4b5d8a18",
+            "real of detected / detected",
+        ),
+        _last_run_stat_card(
+            "Recall",
+            _last_run_rate_text(
+                float(counts.get("recall", 0.0)),
+                defined=int(counts["n_real_total"]) > 0,
+            ),
+            "#6b3fa0",
+            "#6b3fa018",
+            "real of detected / total real",
+        ),
+        _last_run_stat_card(
+            "Unhappiness",
+            _last_run_unhappiness_text(
+                counts,
+                defined=int(counts["n_detected"]) > 0 and int(counts["n_real_total"]) > 0,
+            ),
+            "#8a3b2b",
+            "#8a3b2b18",
+            "100 × ((P − 0.95)² + (R − 0.95)²) · lower is better",
+        ),
+    ]
+    row_style = (
+        "display:flex;flex-wrap:wrap;gap:0.7rem;margin:0.35rem 0 0.35rem 0;"
+    )
     st.markdown(
-        "<div style='display:flex;flex-wrap:wrap;gap:0.7rem;margin:0.35rem 0 0.85rem 0;'>"
-        + "".join(cards)
-        + "</div>",
+        f"<div style='{row_style}'>{''.join(counts_row)}</div>"
+        f"<div style='{row_style}margin-bottom:0.85rem;'>{''.join(rates_row)}</div>",
         unsafe_allow_html=True,
     )
     extra = []
     if counts["n_unlabeled"]:
-        extra.append(f"{counts['n_unlabeled']:,} unlabeled (orange)")
+        extra.append(f"{int(counts['n_unlabeled']):,} unlabeled (orange)")
     if counts["n_not_sure"]:
-        extra.append(f"{counts['n_not_sure']:,} not sure (blue)")
+        extra.append(f"{int(counts['n_not_sure']):,} not sure (blue)")
+    if counts.get("n_undetected_below"):
+        extra.append(
+            f"{int(counts['n_undetected_below']):,} inspect marks below "
+            f"{float(min_size_nm) / NM_PER_UM:.0f} µm not counted"
+        )
     if extra:
         st.caption(" · ".join(extra) + ".")
+
+
+def _render_last_run_tile_table(table: pd.DataFrame) -> None:
+    if table is None or table.empty:
+        st.info("No tiles to score in this folder.")
+        return
+    display = table.copy()
+    rename = {
+        "tile": "Tile",
+        "n_detected": "Detected",
+        "n_real": "Real of detected",
+        "n_fake": "Fake of detected",
+        "n_real_total": "Total real",
+        "n_undetected": "Undetected",
+        "precision": "Precision",
+        "recall": "Recall",
+        "unhappiness": "Unhappiness (%)",
+    }
+    keep = [col for col in rename if col in display.columns]
+    display = display[keep].rename(columns=rename)
+    for col in ("Detected", "Real of detected", "Fake of detected", "Total real", "Undetected"):
+        if col in display.columns:
+            display[col] = display[col].astype(int)
+    st.dataframe(
+        display,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Precision": st.column_config.NumberColumn("Precision", format="%.1%"),
+            "Recall": st.column_config.NumberColumn("Recall", format="%.1%"),
+            "Unhappiness (%)": st.column_config.NumberColumn(
+                "Unhappiness (%)", format="%.2f"
+            ),
+        },
+    )
 
 
 def render_labeled_tiles_tab(
@@ -613,26 +804,34 @@ def render_labeled_tiles_tab(
         "Always the latest Detection → Run pipeline result "
         "(not the labeling recall table). "
         "Orange = unlabeled detector hit · green = labeled particle · "
-        "red = not-particle · blue = not sure."
+        "red = not-particle · blue = not sure. "
+        "A label on N, S, E, W, or particles-only in this scene is applied to all of them "
+        "(Groundup v3 is not mixed with v2)."
     )
     run_config = dict(config)
     session_config = st.session_state.get("config")
     if isinstance(session_config, dict):
         run_config.update(session_config)
-    last_csv: Path | None = None
+    last_csv, pipeline_config = load_last_pipeline(run_config)
+    for key in (
+        "input_dir",
+        "output_dir",
+        "pixel_size_nm",
+        "overlap_fraction",
+        "filename_pattern",
+    ):
+        value = pipeline_config.get(key)
+        if value not in (None, ""):
+            run_config[key] = value
     detections: pd.DataFrame | None = None
     if table is not None:
-        last_csv_text = st.session_state.get("last_pipeline_csv")
-        last_csv = Path(str(last_csv_text)) if last_csv_text else None
         detections = tag_table(table, last_csv)
-    if detections is None:
-        last_csv, run_config = load_last_pipeline(run_config)
-        if last_csv is not None and last_csv.is_file():
-            try:
-                detections = load_particles_csv(last_csv)
-            except (ValueError, OSError) as exc:
-                st.error(str(exc))
-                return
+    elif last_csv is not None and last_csv.is_file():
+        try:
+            detections = load_particles_csv(last_csv)
+        except (ValueError, OSError) as exc:
+            st.error(str(exc))
+            return
     if detections is None:
         st.info("Run the pipeline on the Detection tab. This tab follows that run.")
         return
@@ -640,44 +839,118 @@ def render_labeled_tiles_tab(
     store = labels_store(project_root)
     labels_df = store.load()
     run_tiles = input_tile_names(run_config)
-    recovery_tiles = sorted(run_tiles) if run_tiles else tile_names_for_hits(detections)
-    counts = last_run_class_counts(
-        detections, labels_df, tile_names=recovery_tiles or None
+    scene_tiles = related_scene_tile_names(
+        cfg_get(run_config, "input_dir", None), run_tiles
     )
-    _render_last_run_summary(counts)
+    if labels_df is not None and not labels_df.empty and scene_tiles:
+        tile = labels_df["source_tile"].astype(str).map(
+            lambda path: str(path).replace("\\", "/").rsplit("/", 1)[-1]
+        )
+        labels_df = labels_df.loc[tile.isin(scene_tiles)].copy()
+    detections = snap_detection_keys_to_labels(
+        detections,
+        labels_df,
+        _nsew_merge_radius_nm(run_config),
+        _nsew_size_match_fraction(run_config),
+    )
+    folder_name = Path(str(cfg_get(run_config, "input_dir", "") or "")).name
+    if folder_name:
+        st.caption(
+            f"Scoring labels from **{folder_name}** and the same-scene N/S/E/W "
+            "and particles-only files"
+            + (f" ({', '.join(sorted(scene_tiles))})" if scene_tiles else "")
+            + "."
+        )
+    recovery_tiles = sorted(run_tiles) if run_tiles else tile_names_for_hits(detections)
+    size_floor_nm = undetected_size_floor_nm(detections, run_config)
+    names = expand_direction_tile_names(
+        tile_names_for_hits(detections), recovery_tiles or run_tiles
+    )
+    metric_tiles = list(recovery_tiles or names)
+    label_tiles = list(scene_tiles) if scene_tiles else metric_tiles
+    per_tile_table = last_run_class_counts_by_tile(
+        detections,
+        labels_df,
+        metric_tiles,
+        min_size_nm=size_floor_nm,
+        folder_tiles=label_tiles,
+    )
+    folder_counts = last_run_class_counts(
+        detections,
+        labels_df,
+        tile_names=metric_tiles or None,
+        min_size_nm=size_floor_nm,
+        folder_tiles=label_tiles,
+    )
 
-    names = tile_names_for_hits(detections)
+    scope = st.radio(
+        "Metrics",
+        options=["all_tiles", "per_tile"],
+        format_func=lambda value: (
+            "All tiles in folder" if value == "all_tiles" else "Tile by tile"
+        ),
+        horizontal=True,
+        key="last_run_metrics_scope",
+        help="Folder totals match the previous Last Run summary. "
+        "Tile by tile scores each file in that folder on its own.",
+    )
+
+    if names:
+        st.session_state["_labeled_review_tile_names"] = names
+        if st.session_state.get("labeled_review_tile") not in names:
+            st.session_state["labeled_review_tile"] = names[0]
+        nav = st.columns([1, 4, 1])
+        nav[0].button(
+            "Previous",
+            width="stretch",
+            key="labeled_review_prev",
+            on_click=_advance_labeled_review_tile,
+            args=(-1,),
+        )
+        nav[1].selectbox("Tile", names, key="labeled_review_tile")
+        nav[2].button(
+            "Next",
+            width="stretch",
+            key="labeled_review_next",
+            on_click=_advance_labeled_review_tile,
+            args=(1,),
+        )
+
+    if scope == "per_tile":
+        tile_name = str(st.session_state.get("labeled_review_tile") or "")
+        if tile_name:
+            counts = last_run_class_counts(
+                detections,
+                labels_df,
+                tile_names=[tile_name],
+                min_size_nm=size_floor_nm,
+                folder_tiles=label_tiles,
+            )
+            st.caption(
+                f"Counts for **{tile_name}** only "
+                "(hits on this file; NSEW labels still count as real / missed)."
+            )
+        else:
+            counts = folder_counts
+        _render_last_run_summary(counts, min_size_nm=size_floor_nm)
+        _render_last_run_tile_table(per_tile_table)
+    else:
+        st.caption("Counts for every tile in the last-run folder.")
+        _render_last_run_summary(folder_counts, min_size_nm=size_floor_nm)
+
     if not names:
         st.info("The last pipeline run has no detections.")
         return
 
-    label_map: dict[str, str] = {}
-    if not labels_df.empty:
-        for record in labels_df.to_dict(orient="records"):
-            label_map[str(record["key"])] = str(record["label"])
-
-    st.session_state["_labeled_review_tile_names"] = names
-    if st.session_state.get("labeled_review_tile") not in names:
-        st.session_state["labeled_review_tile"] = names[0]
-    nav = st.columns([1, 4, 1])
-    nav[0].button(
-        "Previous",
-        width="stretch",
-        key="labeled_review_prev",
-        on_click=_advance_labeled_review_tile,
-        args=(-1,),
-    )
-    nav[1].selectbox("Tile", names, key="labeled_review_tile")
-    nav[2].button(
-        "Next",
-        width="stretch",
-        key="labeled_review_next",
-        on_click=_advance_labeled_review_tile,
-        args=(1,),
-    )
+    label_map = label_map_with_aliases(labels_df)
 
     tile_name = str(st.session_state["labeled_review_tile"])
     tile_hits = detections_on_tile(detections, tile_name)
+    extra = _label_rows_missing_from_hits(
+        labels_df, tile_name, tile_hits, folder_tiles=label_tiles
+    )
+    if extra is not None and not extra.empty:
+        tile_hits = pd.concat([tile_hits, extra], ignore_index=True)
     index = names.index(tile_name)
     n_labeled = sum(str(key) in label_map for key in tile_hits["key"].astype(str)) if not tile_hits.empty else 0
     source = last_csv if last_csv is not None else "current session"
@@ -721,7 +994,11 @@ def render_labeled_tiles_tab(
     if view.rgb.size == 0:
         st.error("No pixels to show for this tile.")
     else:
-        st.image(view.rgb, caption=f"{tile_name} · detector hits", width="stretch")
+        st.image(
+            view.rgb,
+            caption=f"{tile_name} · detector hits",
+            width=LAST_RUN_OVERVIEW_WIDTH,
+        )
 
     st.subheader("Zoomed detector hits")
     if tile_hits.empty:
@@ -738,10 +1015,10 @@ def render_labeled_tiles_tab(
     )
     start = (page - 1) * GALLERY_PAGE_SIZE
     end = start + GALLERY_PAGE_SIZE
-    columns = st.columns(3)
+    columns = st.columns(LAST_RUN_CROP_COLUMNS)
     records = tile_hits.to_dict(orient="records")
     for offset, record in enumerate(records[start:end]):
-        with columns[offset % 3]:
+        with columns[offset % LAST_RUN_CROP_COLUMNS]:
             x_local = x_locals[start + offset]
             y_local = y_locals[start + offset]
             key = str(record.get("key", ""))
@@ -766,17 +1043,30 @@ def _label_rows_missing_from_hits(
     labels_df: pd.DataFrame,
     tile_name: str,
     hits: pd.DataFrame,
+    folder_tiles: list[str] | None = None,
 ) -> pd.DataFrame | None:
     """Labeled marks on this tile that are not in the current detection CSV."""
     if labels_df is None or labels_df.empty:
         return None
-    names = labels_df["source_tile"].astype(str).map(lambda path: str(path).replace("\\", "/").rsplit("/", 1)[-1])
+    names = labels_df["source_tile"].astype(str).map(
+        lambda path: str(path).replace("\\", "/").rsplit("/", 1)[-1]
+    )
     on_tile = labels_df.loc[names == str(tile_name)].copy()
+    if is_nsew_family_tile(tile_name):
+        allowed = {
+            Path(name).name
+            for name in (folder_tiles or [tile_name])
+            if is_nsew_family_tile(str(name))
+        }
+        allowed.add(str(tile_name))
+        on_tile = labels_df.loc[names.isin(allowed)].copy()
+        if "key" in on_tile.columns:
+            on_tile = on_tile.drop_duplicates(subset=["key"], keep="last")
     if on_tile.empty:
         return None
     known = set()
     if hits is not None and not hits.empty and "key" in hits.columns:
-        known = set(hits["key"].astype(str))
+        known = expand_labeled_keys(hits["key"].astype(str))
     missing = on_tile.loc[~on_tile["key"].astype(str).isin(known)]
     if missing.empty:
         return None

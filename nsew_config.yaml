@@ -1,0 +1,28 @@
+# Groundup / N/S/E/W standard values.
+# Sidebar checkbox: Apply NSEW settings.
+pixel_size_nm: 3500.0
+preprocessing:
+  denoise: true
+  denoise_sigma: 0.5
+  flatten_illumination: true
+  flatten_sigma: 160.0
+  contrast_stretch: true
+  contrast_percentiles:
+  - 1.0
+  - 99.0
+detection:
+  method: fft
+  fft_peak_threshold: 0.35
+  blob_threshold: 0.3
+  min_prominence: 0.3
+  min_confidence: 0.5
+  blob_min_sigma: 9.0
+  blob_max_sigma: 36.0
+  edge_exclude_px: 12.0
+  min_circularity: 0.0
+  structure_neighbor_px: 48.0
+  tophat_radius: 50
+ml:
+  enabled: true
+  model_path: models/particle_clf_v5.joblib
+  threshold: 0.55

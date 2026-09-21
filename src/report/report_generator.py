@@ -74,6 +74,15 @@ def overlay_markers(
     if particles.empty or rgb.size == 0:
         return rgb
 
+    placed_names = {placement.name for placement in mosaic.placements}
+    if placed_names and "source_tile" in particles.columns:
+        names = particles["source_tile"].astype(str).map(
+            lambda path: str(path).replace("\\", "/").rsplit("/", 1)[-1]
+        )
+        particles = particles.loc[names.isin(placed_names)]
+        if particles.empty:
+            return rgb
+
     pixel_size = float(cfg_get(config, "pixel_size_nm", 1.0))
     if pixel_size <= 0:
         pixel_size = 1.0

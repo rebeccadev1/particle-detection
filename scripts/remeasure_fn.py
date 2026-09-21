@@ -122,7 +122,7 @@ def main(argv: list[str] | None = None) -> int:
             "run",
             config["input_dir"],
             "recall",
-            config["detection"]["recall_mode"],
+            config["detection"].get("min_confidence"),
             "ml",
             config["ml"],
             flush=True,

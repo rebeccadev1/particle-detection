@@ -11,7 +11,12 @@ import numpy as np
 import pandas as pd
 
 from src.config import cfg_get
-from src.io.tile_loader import DEFAULT_FILENAME_PATTERN, parse_tile_filename
+from src.io.tile_loader import (
+    DEFAULT_FILENAME_PATTERN,
+    TILE_SUFFIXES,
+    parse_tile_filename,
+    resolve_input_dir,
+)
 from src.labeling.crops import (
     CIRCLE_COLOR,
     CIRCLE_THICKNESS,
@@ -24,7 +29,13 @@ from src.labeling.crops import (
     global_nm_to_local_px,
     placement_for_tile,
 )
-from src.labeling.queue import detection_key, tagged_if_needed
+from src.labeling.queue import detection_key, label_map_with_aliases, nsew_key_aliases, tagged_if_needed
+from src.measurement.measurer import (
+    DIRECTION_STEMS,
+    is_direction_tile,
+    is_nsew_family_tile,
+    is_particles_only_tile,
+)
 from src.report.report_generator import _to_display_rgb
 from src.stitching.stitcher import TilePlacement
 
@@ -37,6 +48,17 @@ UNLABELED_CIRCLE_COLOR = CIRCLE_COLOR
 OVERVIEW_MAX_SIDE = 960
 ZOOM_MAX_SIDE = 1080
 INSPECT_DISPLAY_WIDTH = 960
+UNHAPPINESS_TARGET = 0.95
+
+
+def unhappiness_score(precision: float, recall: float) -> float:
+    """``100 × ((P - 0.95)² + (R - 0.95)²)`` with P and R in 0–1. Lower is better."""
+    return 100.0 * (
+        (float(precision) - UNHAPPINESS_TARGET) ** 2
+        + (float(recall) - UNHAPPINESS_TARGET) ** 2
+    )
+
+
 GRID_N = 3
 CELL_NAMES = (
     ("NW", "N", "NE"),
@@ -45,6 +67,7 @@ CELL_NAMES = (
 )
 MISS_SOURCE = "tile_inspect"
 DEFAULT_MISS_SIZE_UM = 15.0
+_PARTICLES_ONLY_DIR_NAMES = {"particles only", "particles only output"}
 
 
 @dataclass(frozen=True)
@@ -75,12 +98,37 @@ def cell_bounds(
 
 
 def detections_on_tile(table: pd.DataFrame | None, tile_name: str) -> pd.DataFrame:
-    """Rows whose ``source_tile`` basename matches ``tile_name``."""
+    """Rows for ``tile_name``. N/S/E/W share one aligned view, so a hit on any
+    of those four is shown on all four. Particles-only 2/3/4-of-4 files do not
+    share hits: they are different combined images.
+    """
     if table is None or table.empty:
         return pd.DataFrame()
-    name = str(tile_name)
+    name = _basename(tile_name)
     names = table["source_tile"].astype(str).map(_basename)
-    return table.loc[names == name].reset_index(drop=True)
+    mask = names == name
+    if is_direction_tile(name):
+        mask = mask | names.map(is_direction_tile)
+        if "nsew_dirs" in table.columns:
+            stem = Path(name).stem.upper()
+            dirs = table["nsew_dirs"].fillna("").astype(str).str.upper()
+            mask = mask | dirs.map(
+                lambda text: stem
+                in {part.strip() for part in str(text).replace(";", ",").split(",") if part.strip()}
+            )
+    hits = table.loc[mask].copy()
+    if hits.empty:
+        return hits.reset_index(drop=True)
+    if is_direction_tile(name):
+        hits = tagged_if_needed(hits)
+        hits["source_tile"] = name
+        if "key" in hits.columns:
+            hits = hits.drop_duplicates(subset=["key"], keep="first")
+        else:
+            hits = hits.drop_duplicates(
+                subset=["x_global", "y_global"], keep="first"
+            )
+    return hits.reset_index(drop=True)
 
 
 def labeled_detections(
@@ -105,46 +153,65 @@ def labeled_detections(
     return hits.merge(extra, on="key", how="left", suffixes=("", "_label")).reset_index(drop=True)
 
 
+def _tiles_for_folder_labels(
+    tile_names: Sequence[str] | None,
+    folder_tiles: Sequence[str] | None = None,
+) -> set[str] | None:
+    """Exact tile basenames whose labels count for this folder.
+
+    N/S/E/W and particles-only versions share labels only among files that
+    are actually in ``folder_tiles`` (or ``tile_names``). ``N.bmp`` from
+    another folder is not mixed with ``N.png``.
+    """
+    if tile_names is None and folder_tiles is None:
+        return None
+    wanted = {_basename(name) for name in (tile_names or ())}
+    allowed = {
+        _basename(name)
+        for name in (folder_tiles if folder_tiles is not None else tile_names or ())
+    }
+    if any(is_nsew_family_tile(name) for name in wanted):
+        wanted.update(name for name in allowed if is_nsew_family_tile(name))
+    return wanted
+
+
 def last_run_class_counts(
     detections: pd.DataFrame | None,
     labels: pd.DataFrame | None,
     tile_names: Sequence[str] | None = None,
-) -> dict[str, int]:
+    min_size_nm: float = 0.0,
+    folder_tiles: Sequence[str] | None = None,
+) -> dict[str, float]:
     """Last-run detection totals split by label, plus missed inspect marks.
 
     * ``n_detected`` — every last-run hit
-    * ``n_real`` — of those hits, labeled particle (green)
-    * ``n_fake`` — of those hits, labeled not-particle (red)
-    * ``n_unlabeled`` — hits with no label (orange)
-    * ``n_undetected`` — ``tile_inspect`` particle marks on these tiles whose
-      keys are not in the last run
-    * ``n_real_total`` — green circles only (same as ``n_real``)
+    * ``n_real`` — detected and labeled particle (green)
+    * ``n_fake`` — detected and not labeled as particle (red, orange, blue)
+    * ``n_unlabeled`` — hits with no label (orange); also counted in ``n_fake``
+    * ``n_undetected`` — labeled particles on these tiles whose keys are not
+      in the last run (inspect marks and other misses), at least
+      ``min_size_nm`` when that floor is > 0 (Last Run shows this as
+      undetected real ≥ that size, typically 20 µm)
+    * ``n_real_total`` — ``n_real`` + ``n_undetected``
+    * ``precision`` — ``n_real / n_detected`` (unlabeled hits count as fake)
+    * ``recall`` — ``n_real / n_real_total``
+    * ``unhappiness`` — ``100 × ((P - 0.95)² + (R - 0.95)²)`` (lower is better)
     """
-    empty = {
-        "n_detected": 0,
-        "n_real": 0,
-        "n_fake": 0,
-        "n_unlabeled": 0,
-        "n_undetected": 0,
-        "n_not_sure": 0,
-        "n_real_total": 0,
-    }
     tagged = tagged_if_needed(detections) if detections is not None else pd.DataFrame()
     if tile_names is not None and not tagged.empty:
         wanted = {_basename(name) for name in tile_names}
         tile = tagged["source_tile"].astype(str).map(_basename)
         tagged = tagged.loc[tile.isin(wanted)]
     n_detected = int(len(tagged)) if tagged is not None and not tagged.empty else 0
-    label_map: dict[str, str] = {}
+    scoped = labels
+    label_tiles = _tiles_for_folder_labels(tile_names, folder_tiles)
+    if scoped is not None and not scoped.empty and label_tiles is not None:
+        tile = scoped["source_tile"].astype(str).map(_basename)
+        scoped = scoped.loc[tile.isin(label_tiles)]
+    label_map = label_map_with_aliases(scoped)
     particles = pd.DataFrame()
-    if labels is not None and not labels.empty:
-        for record in labels.to_dict(orient="records"):
-            label_map[str(record["key"])] = str(record["label"])
-        particles = labels.loc[labels["label"].astype(str) == "particle"].copy()
-        if tile_names is not None and not particles.empty:
-            wanted = {_basename(name) for name in tile_names}
-            tile = particles["source_tile"].astype(str).map(_basename)
-            particles = particles.loc[tile.isin(wanted)]
+    if scoped is not None and not scoped.empty:
+        particles = scoped.loc[scoped["label"].astype(str) == "particle"].copy()
 
     n_real = n_fake = n_not_sure = n_unlabeled = 0
     det_keys: set[str] = set()
@@ -154,25 +221,86 @@ def last_run_class_counts(
             name = label_map.get(str(key), "")
             if name == "particle":
                 n_real += 1
-            elif name == "not_particle":
-                n_fake += 1
-            elif name == "not_sure":
-                n_not_sure += 1
             else:
-                n_unlabeled += 1
+                n_fake += 1
+                if name == "not_sure":
+                    n_not_sure += 1
+                elif name != "not_particle":
+                    n_unlabeled += 1
     n_undetected = 0
-    if not particles.empty and "source_csv" in particles.columns:
-        inspect = particles.loc[particles["source_csv"].astype(str) == MISS_SOURCE]
-        n_undetected = int((~inspect["key"].astype(str).isin(det_keys)).sum())
+    n_undetected_below = 0
+    if not particles.empty and "key" in particles.columns:
+        missing = particles.loc[~particles["key"].astype(str).isin(det_keys)]
+        n_all_missing = int(len(missing))
+        floor = float(min_size_nm or 0.0)
+        if floor > 0 and not missing.empty and "size" in missing.columns:
+            sizes = pd.to_numeric(missing["size"], errors="coerce")
+            missing = missing.loc[sizes >= floor]
+        n_undetected = int(len(missing))
+        n_undetected_below = max(0, n_all_missing - n_undetected)
+    n_real_total = n_real + n_undetected
+    precision = (n_real / n_detected) if n_detected else 0.0
+    recall = (n_real / n_real_total) if n_real_total else 0.0
     return {
         "n_detected": n_detected,
         "n_real": n_real,
         "n_fake": n_fake,
         "n_unlabeled": n_unlabeled,
         "n_undetected": n_undetected,
+        "n_undetected_below": n_undetected_below,
         "n_not_sure": n_not_sure,
-        "n_real_total": n_real,
+        "n_real_total": n_real_total,
+        "precision": precision,
+        "recall": recall,
+        "unhappiness": unhappiness_score(precision, recall),
     }
+
+
+def last_run_class_counts_by_tile(
+    detections: pd.DataFrame | None,
+    labels: pd.DataFrame | None,
+    tile_names: Sequence[str],
+    min_size_nm: float = 0.0,
+    folder_tiles: Sequence[str] | None = None,
+) -> pd.DataFrame:
+    """``last_run_class_counts`` for each tile basename, one row per tile.
+
+    Hits are those whose ``source_tile`` is that file (N/S/E/W still share).
+    ``folder_tiles`` is the label scene (e.g. N.png plus particles-only).
+    """
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    label_tiles = list(folder_tiles) if folder_tiles is not None else list(tile_names)
+    for name in tile_names:
+        tile = _basename(name)
+        if tile in seen:
+            continue
+        seen.add(tile)
+        counts = last_run_class_counts(
+            detections,
+            labels,
+            tile_names=[tile],
+            min_size_nm=min_size_nm,
+            folder_tiles=label_tiles,
+        )
+        rows.append({"tile": tile, **counts})
+    return pd.DataFrame(rows)
+
+
+def undetected_size_floor_nm(
+    detections: pd.DataFrame | None,
+    config: Mapping[str, Any] | None = None,
+) -> float:
+    """Size gate for Last Run misses: this run's min size, else config."""
+    floor = 0.0
+    if config is not None:
+        floor = float(cfg_get(dict(config), "detection.min_size_nm", 0.0) or 0.0)
+    if detections is not None and not detections.empty and "size" in detections.columns:
+        run_min = float(pd.to_numeric(detections["size"], errors="coerce").min())
+        if np.isfinite(run_min) and run_min > 0:
+            run_floor = float(np.floor(run_min / 1000.0) * 1000.0)
+            floor = max(floor, run_floor)
+    return floor
 
 
 def labeled_particle_recovery(
@@ -215,8 +343,147 @@ def tile_names_for_hits(hits: pd.DataFrame | None) -> list[str]:
     return names
 
 
+def expand_direction_tile_names(
+    names: Sequence[str],
+    available: Sequence[str] | None,
+) -> list[str]:
+    """If hits include N/S/E/W or particles-only, list every family file in the folder."""
+    ordered = list(names)
+    if available is None:
+        return ordered
+    if not any(is_nsew_family_tile(name) for name in ordered):
+        return ordered
+    have = {_basename(name) for name in ordered}
+    extras = [
+        _basename(name)
+        for name in available
+        if is_nsew_family_tile(name) and _basename(name) not in have
+    ]
+
+    def _family_sort(name: str) -> tuple[int, str]:
+        stem = Path(name).stem.upper()
+        if stem in DIRECTION_STEMS:
+            return (DIRECTION_STEMS.index(stem), name)
+        if is_particles_only_tile(name):
+            return (10, name.lower())
+        return (99, name.lower())
+
+    extras.sort(key=_family_sort)
+    return ordered + extras
+
+
+def _scene_image_names(folder: Path) -> set[str]:
+    if not folder.is_dir():
+        return set()
+    names: set[str] = set()
+    try:
+        entries = folder.iterdir()
+    except OSError:
+        return names
+    for path in entries:
+        if path.is_file() and path.suffix.lower() in TILE_SUFFIXES:
+            names.add(path.name)
+    return names
+
+
+def _resolve_scene_folder(folder: str | Path) -> Path | None:
+    text = str(folder).strip()
+    if not text:
+        return None
+    try:
+        return resolve_input_dir(text)
+    except FileNotFoundError:
+        path = Path(text).expanduser()
+        try:
+            if path.is_dir():
+                return path.resolve()
+        except OSError:
+            return None
+        return None
+
+
+def scene_folders(folder: str | Path) -> list[Path]:
+    """This folder plus sibling N/S/E/W and Particles-only dirs for the same scene."""
+    resolved = _resolve_scene_folder(folder)
+    if resolved is None:
+        return []
+    folder = resolved
+    roots: list[Path] = []
+
+    def add(path: Path) -> None:
+        try:
+            resolved_path = path.resolve()
+        except OSError:
+            return
+        if resolved_path.is_dir() and resolved_path not in roots:
+            roots.append(resolved_path)
+
+    add(folder)
+    lower = folder.name.lower()
+    if lower in _PARTICLES_ONLY_DIR_NAMES:
+        add(folder.parent)
+        if folder.parent.name.lower().startswith("output "):
+            add(folder.parent.parent)
+            add(folder.parent / "Particles only")
+    elif lower.startswith("output "):
+        add(folder.parent)
+        add(folder / "Particles only")
+    else:
+        add(folder / "Particles only")
+        add(folder / "Particles only output")
+        add(folder / f"Output {folder.name}")
+        add(folder / f"Output {folder.name}" / "Particles only")
+    return roots
+
+
+def related_scene_tile_names(
+    folder: str | Path | None,
+    current_names: Sequence[str] | None = None,
+) -> set[str]:
+    """N/S/E/W and particles-only basenames for this scene, matching this folder's suffix.
+
+    Groundup v3 (``.png``) is not mixed with Groundup v2 (``.bmp``).
+    """
+    current = {_basename(name) for name in (current_names or ())}
+    if folder in (None, ""):
+        return _with_family_suffix_names(current)
+    path = _resolve_scene_folder(folder) or Path(str(folder))
+    if not current:
+        current = _scene_image_names(path)
+    suffixes = {Path(name).suffix.lower() for name in current if Path(name).suffix}
+    related = set(current)
+    for root in scene_folders(folder):
+        for name in _scene_image_names(root):
+            if not is_nsew_family_tile(name):
+                continue
+            if suffixes and Path(name).suffix.lower() not in suffixes:
+                continue
+            related.add(name)
+    return _with_family_suffix_names(related)
+
+
+def _with_family_suffix_names(names: set[str]) -> set[str]:
+    """If this scene is particles-only, also keep N/S/E/W with the same suffix."""
+    related = set(names)
+    suffixes = {Path(name).suffix.lower() for name in related if Path(name).suffix}
+    if not suffixes:
+        return related
+    if not any(is_particles_only_tile(name) for name in related):
+        return related
+    if any(is_direction_tile(name) for name in related):
+        return related
+    for suffix in suffixes:
+        related.update(f"{stem}{suffix}" for stem in DIRECTION_STEMS)
+    return related
+
+
 def label_color_for_key(key: str, labels: Mapping[str, str]) -> tuple[int, int, int]:
     name = labels.get(str(key))
+    if name not in LABEL_CIRCLE_COLORS:
+        for alias in nsew_key_aliases(str(key)):
+            name = labels.get(alias)
+            if name in LABEL_CIRCLE_COLORS:
+                break
     if name in LABEL_CIRCLE_COLORS:
         return LABEL_CIRCLE_COLORS[name]
     return UNLABELED_CIRCLE_COLOR

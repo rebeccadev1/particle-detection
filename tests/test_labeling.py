@@ -10,10 +10,13 @@ import pandas as pd
 from src.labeling.crops import (
     CIRCLE_COLOR,
     TileImageCache,
+    crop_direction_views,
     crop_particle,
     crop_window,
+    find_tile_path,
     global_nm_to_local_px,
 )
+from src.labeling.inspect import detections_on_tile
 from src.labeling.queue import (
     MIN_SIZE_NM,
     detection_key,
@@ -59,6 +62,15 @@ def test_global_nm_to_local_px_subtracts_origin() -> None:
     x_local, y_local = global_nm_to_local_px(960.0, 480.0, placement, pixel_size_nm=2.0)
     assert x_local == 960.0 / 2.0 - 80
     assert y_local == 480.0 / 2.0 - 100
+
+
+def test_find_tile_path_accepts_bmp_for_tif_name(tmp_path: Path) -> None:
+    import cv2
+
+    gray = np.zeros((8, 8), dtype=np.uint8)
+    assert cv2.imwrite(str(tmp_path / "R3_1_1_5X.bmp"), gray)
+    found = find_tile_path("R3_1_1_5X.tif", input_dir=tmp_path)
+    assert found.name == "R3_1_1_5X.bmp"
 
 
 def test_crop_window_clamps_to_tile_edges() -> None:
@@ -168,6 +180,173 @@ def test_unlabeled_queue_skips_labeled_keys() -> None:
     queue = unlabeled_queue([tagged], skip)
     assert len(queue) == 1
     assert int(queue.iloc[0]["id"]) == 2
+
+
+def test_nsew_label_covers_all_four_directions(tmp_path: Path) -> None:
+    store = LabelStore(tmp_path / "labels")
+    rgb = np.zeros((16, 16, 3), dtype=np.uint8)
+    south = {
+        "id": 1,
+        "source_tile": "S.bmp",
+        "x_global": 100.4,
+        "y_global": 200.4,
+        "size": 20_000.0,
+        "confidence": 0.8,
+        "source_csv": "particles.csv",
+    }
+    store.apply_label(south, "particle", rgb)
+    assert detection_key(south) == "NSEW_100_200"
+    assert store.labeled_keys() == {"NSEW_100_200"}
+    detections = pd.DataFrame(
+        {
+            "id": [1, 2, 3],
+            "x_global": [100.4, 100.4, 50.0],
+            "y_global": [200.4, 200.4, 50.0],
+            "size": [20_000.0, 21_000.0, 22_000.0],
+            "confidence": [0.9, 0.7, 0.6],
+            "source_tile": ["N.bmp", "E.bmp", "loose.tif"],
+        }
+    )
+    queue = unlabeled_queue([tag_table(detections)], store.labeled_keys())
+    assert list(queue["source_tile"]) == ["loose.tif"]
+    hits = detections_on_tile(tag_table(detections), "W.bmp")
+    assert "NSEW_100_200" in set(hits["key"].astype(str))
+    assert set(hits["source_tile"].astype(str)) == {"W.bmp"}
+
+
+def test_particles_only_shares_nsew_key_and_skips_labeled_location(tmp_path: Path) -> None:
+    store = LabelStore(tmp_path / "labels")
+    rgb = np.zeros((16, 16, 3), dtype=np.uint8)
+    north = {
+        "id": 1,
+        "source_tile": "N.png",
+        "x_global": 100.4,
+        "y_global": 200.4,
+        "size": 20_000.0,
+        "confidence": 0.8,
+        "source_csv": "particles.csv",
+    }
+    store.apply_label(north, "particle", rgb)
+    only = {
+        "id": 2,
+        "source_tile": "particles_only_2of4.png",
+        "x_global": 100.4,
+        "y_global": 200.4,
+        "size": 21_000.0,
+        "confidence": 0.9,
+    }
+    four = {
+        "id": 3,
+        "source_tile": "particles_only_4of4.png",
+        "x_global": 100.4,
+        "y_global": 200.4,
+        "size": 22_000.0,
+        "confidence": 0.7,
+    }
+    other = {
+        "id": 4,
+        "source_tile": "particles_only_2of4.png",
+        "x_global": 1_000_000.0,
+        "y_global": 50.0,
+        "size": 23_000.0,
+        "confidence": 0.6,
+    }
+    assert detection_key(only) == "NSEW_100_200"
+    assert detection_key(four) == detection_key(north)
+    detections = pd.DataFrame([only, four, other])
+    queue = unlabeled_queue(
+        [tag_table(detections)],
+        store.labeled_keys(),
+        nsew_merge_radius_nm=24.0,
+        nsew_size_match_fraction=0.4,
+    )
+    assert list(queue["source_tile"]) == ["particles_only_2of4.png"]
+    assert float(queue.iloc[0]["x_global"]) == 1_000_000.0
+
+
+def test_snap_keys_reuses_nearby_nsew_label() -> None:
+    from src.labeling.queue import snap_detection_keys_to_labels
+
+    labels = pd.DataFrame(
+        {
+            "key": ["NSEW_100_200"],
+            "label": ["particle"],
+            "source_tile": ["N.png"],
+            "x_global": [100.0],
+            "y_global": [200.0],
+            "size": [20_000.0],
+        }
+    )
+    detections = pd.DataFrame(
+        {
+            "id": [1, 2],
+            "source_tile": ["particles_only_2of4.png", "particles_only_2of4.png"],
+            "x_global": [118.0, 1_000_000.0],
+            "y_global": [204.0, 50.0],
+            "size": [21_000.0, 22_000.0],
+            "confidence": [0.9, 0.8],
+        }
+    )
+    snapped = snap_detection_keys_to_labels(
+        tag_table(detections), labels, merge_radius_nm=24.0, size_match_fraction=0.0
+    )
+    assert str(snapped.iloc[0]["key"]) == "NSEW_100_200"
+    assert str(snapped.iloc[1]["key"]) != "NSEW_100_200"
+    queue = unlabeled_queue(
+        [tag_table(detections)],
+        labels["key"],
+        nsew_merge_radius_nm=24.0,
+        nsew_size_match_fraction=0.0,
+        labels=labels,
+    )
+    assert list(queue["x_global"]) == [1_000_000.0]
+
+
+def test_tinder_queue_merges_nwes_offset_hits() -> None:
+    detections = pd.DataFrame(
+        {
+            "id": [1, 2, 3, 4, 5],
+            "x_global": [100.0, 118.0, 108.0, 95.0, 800.0],
+            "y_global": [200.0, 204.0, 198.0, 205.0, 200.0],
+            "size": [20_000.0, 21_000.0, 22_000.0, 19_000.0, 23_000.0],
+            "confidence": [0.9, 0.5, 0.7, 0.8, 0.6],
+            "source_tile": ["N.bmp", "W.bmp", "E.bmp", "S.bmp", "N.bmp"],
+        }
+    )
+    queue = unlabeled_queue(
+        [tag_table(detections)],
+        labeled_keys=(),
+        nsew_merge_radius_nm=24.0,
+        nsew_size_match_fraction=0.4,
+    )
+    assert len(queue) == 2
+    same = queue.loc[queue["x_global"].astype(float) < 400]
+    other = queue.loc[queue["x_global"].astype(float) > 400]
+    assert len(same) == 1
+    assert len(other) == 1
+    assert str(same.iloc[0]["key"]).startswith("NSEW_")
+    assert int(same.iloc[0]["nsew_count"]) == 4
+    assert set(str(same.iloc[0]["nsew_dirs"]).split(",")) == {"N", "W", "E", "S"}
+
+
+def test_crop_direction_views_shows_nwes(tmp_path: Path) -> None:
+    import cv2
+
+    for name in ("N", "W", "E", "S"):
+        gray = np.zeros((48, 48), dtype=np.uint8)
+        gray[20:28, 20:28] = 200
+        assert cv2.imwrite(str(tmp_path / f"{name}.bmp"), gray)
+    row = {
+        "id": 1,
+        "source_tile": "N.bmp",
+        "x_global": 24.0,
+        "y_global": 24.0,
+        "size": 8.0,
+        "confidence": 0.9,
+    }
+    views = crop_direction_views(row, _config(tmp_path))
+    assert list(views) == ["N", "W", "E", "S"]
+    assert all(view.rgb.size > 0 for view in views.values())
 
 
 def test_store_round_trip_and_undo(tmp_path: Path) -> None:

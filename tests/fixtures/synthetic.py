@@ -136,7 +136,7 @@ def detector_test_config(**overrides: object) -> dict:
     config: dict = {
         "pixel_size_nm": 1.0,
         "overlap_fraction": 0.25,
-        "filename_pattern": r"R(?P<run>\d+)_(?P<row>\d+)_(?P<col>\d+)_(?P<mag>[\d.]+)X\.tiff?",
+        "filename_pattern": r"R(?P<run>\d+)_(?P<row>\d+)_(?P<col>\d+)_(?P<mag>[\d.]+)X\.(?:tiff?|bmp|png|jpe?g)",
         "preprocessing": {
             "denoise": False,
             "denoise_sigma": 0.5,

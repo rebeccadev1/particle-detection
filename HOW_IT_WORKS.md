@@ -1,8 +1,10 @@
 # Particle detection on structured wafer surfaces
 
-This project finds **contaminant particles** on optical microscope images of a **patterned wafer**. The images are a grid of overlapping TIFF tiles. The surface itself is periodic (circuit / lithography structure), so the hard problem is not “find bright spots” — it is **ignore the repeating pattern and keep only blob-like debris**.
+This project finds **contaminant particles** on optical microscope images of a **patterned wafer**. The images are a grid of overlapping tiles (TIFF, BMP, PNG, or JPEG). The surface itself is periodic (circuit / lithography structure), so the hard problem is not “find bright spots” — it is **ignore the repeating pattern and keep only blob-like debris**.
 
-This is a **classical image-processing pipeline** with an optional sklearn post-filter on detector hits. Parameters live in `config.yaml` (and the Streamlit sidebar in `app.py`). Changing wafer pitch, magnification, or lighting usually means retuning those numbers. The ML model only scores blobs DoG already found.
+This is a **classical image-processing pipeline** with an optional sklearn / CNN post-filter on detector hits. Parameters live in `config.yaml` (and the Streamlit sidebar in `app.py`). Changing wafer pitch, magnification, or lighting usually means retuning those numbers. The ML model only scores blobs DoG already found.
+
+A second path handles **N/S/E/W directional lighting** of the same field: combine the four angles into a particles-only image, then run the same detector with `nsew_config.yaml` knobs.
 
 ---
 
@@ -16,18 +18,20 @@ This is a **classical image-processing pipeline** with an optional sklearn post-
 6. [Preprocessing](#2-preprocessing)
 7. [Structured-background suppression](#3-structured-background-suppression)
 8. [Local SNR and prominence](#4-local-snr-and-prominence)
-9. [Region-border attenuation](#5-region-border-attenuation)
-10. [Blob detection (difference of Gaussians)](#6-blob-detection-difference-of-gaussians)
-11. [Per-blob filters](#7-per-blob-filters)
-12. [Spatial structure filters](#8-spatial-structure-filters)
-13. [Global coordinates and de-duplication](#9-global-coordinates-and-de-duplication)
-14. [Outputs and the mosaic overlay](#10-outputs-and-the-mosaic-overlay)
-15. [Scale: pixels, micrometres, nanometres](#scale-pixels-micrometres-nanometres)
-16. [Parameter reference](#parameter-reference)
-17. [Tuning: if the result looks wrong](#tuning-if-the-result-looks-wrong)
-18. [What this does not do](#what-this-does-not-do)
-19. [ML cascade (optional)](#ml-cascade-optional)
-20. [How to run](#how-to-run)
+9. [Compact residual islands](#5-compact-residual-islands)
+10. [Region-border attenuation](#6-region-border-attenuation)
+11. [Blob detection (difference of Gaussians)](#7-blob-detection-difference-of-gaussians)
+12. [Per-blob filters](#8-per-blob-filters)
+13. [Spatial structure filters](#9-spatial-structure-filters)
+14. [Global coordinates and de-duplication](#10-global-coordinates-and-de-duplication)
+15. [Outputs and the mosaic overlay](#11-outputs-and-the-mosaic-overlay)
+16. [Scale: pixels, micrometres, nanometres](#scale-pixels-micrometres-nanometres)
+17. [N/S/E/W directional lighting](#nsew-directional-lighting)
+18. [Parameter reference](#parameter-reference)
+19. [Tuning: if the result looks wrong](#tuning-if-the-result-looks-wrong)
+20. [What this does not do](#what-this-does-not-do)
+21. [ML cascade (optional)](#ml-cascade-optional)
+22. [How to run](#how-to-run)
 
 ---
 
@@ -42,7 +46,9 @@ A 5× optical tile of a patterned wafer is not a blank field with specks on it. 
 - **Overlapping tiles** — the same particle can appear on two neighbouring TIFFs, so a wafer-wide table must merge duplicates.
 - **Mixed layout** — neighbouring tiles (and even regions inside one tile) do not share one pitch. A notch mask built on the first tile is wrong for the rest.
 
-A particle of interest is a **compact, irregular bright flake** (clump, diamond, or potato-shaped — not a perfect circle) whose equivalent diameter sits in a size window (default **10–100 µm**). Layout — letters, pad corners, array row starts, fiducials, lattice nodes, box frames — is a false positive the rest of the pipeline exists to reject.
+A particle of interest is a **compact, irregular bright flake** (clump, diamond, or potato-shaped — not a perfect circle). The **reported size window** is **20–100 µm** (`min_size_nm` / `max_size_nm`). DoG still searches from `blob_min_sigma: 3.7` (~10 µm at 0.96 µm/px): raising the search floor to match 20 µm flooded layout false positives on R4. Hits smaller than 20 µm are dropped after measurement.
+
+Layout — letters, pad corners, array row starts, fiducials, lattice nodes, box frames — is a false positive the rest of the pipeline exists to reject.
 
 ---
 
@@ -50,10 +56,10 @@ A particle of interest is a **compact, irregular bright flake** (clump, diamond,
 
 | File | Content |
 |------|---------|
-| `particles.csv` | One row per merged particle: identity, global nm, size, confidence, source tile, plus residual features for the optional ML gate |
-| `mosaic_overlay.jpg` | Downsampled stitch of every tile with a red circle at each detection |
+| `particles.csv` | One row per merged particle: identity, global nm, size, confidence, source tile, N/S/E/W merge fields, plus residual features for the optional ML gate |
+| `mosaic_overlay.jpg` | Downsampled stitch of every *placeable* tile with a red circle at each detection |
 
-The Streamlit app (`streamlit run app.py`) shows the same table, a size histogram in **µm**, and can render a **full-resolution crop** of the mosaic for inspection.
+The Streamlit app (`streamlit run app.py`) has tabs: **Detection**, **NSEW**, **Tiles**, **Last Run**, **Tinder** (label queue), **Database**. Detection shows the table, a size histogram in **µm**, and can render a **full-resolution crop** of the mosaic.
 
 ---
 
@@ -65,29 +71,29 @@ Tiles are large (multi-megapixel) and numerous. Assembling a full-resolution mos
 - mix neighbouring tiles’ illumination and overlap twice,
 - and not help the lattice problem (each tile already has its own pattern).
 
-Instead, detection runs **one tile at a time**, in parallel across CPU **processes** (not threads — OpenCV and NumPy release the GIL poorly for this mix of work). Each worker:
+Instead, detection runs **one tile at a time**, in parallel across CPU **threads** (`ThreadPoolExecutor`). A process pool spawned from Streamlit hangs on macOS (workers re-import the server and the UI stays on “Idle”). Each worker:
 
-1. Loads one TIFF, converts it to grayscale, and **discards the RGB**.
-2. Preprocesses and detects.
+1. Loads one image, converts it to grayscale, and **discards the RGB**.
+2. Preprocesses, detects, optionally ML-filters, then measures.
 3. Returns only particle rows, a placement record, and (optionally) a small thumbnail.
 4. Drops the full-resolution array.
 
 The mosaic is assembled later from those thumbnails. It is a **report**, not an input to detection.
 
-`pipeline.workers: 0` means “use every CPU core.” Each worker process pins OpenCV to **one thread** so *N* processes do not oversubscribe the machine. Set `workers: 1` to debug a single tile without a process pool.
+`pipeline.workers: 0` means “use every CPU core.” When more than one worker is used, OpenCV is pinned to **one thread** so *N* workers do not oversubscribe the machine. Set `workers: 1` to debug a single tile serially.
 
 ---
 
 ## End-to-end data flow
 
 ```
-TIFF folder
+Image folder
     │
-    ├─ match R{run}_{row}_{col}_{mag}X.tif   (skip col 0)
-    ├─ grid origin = min(row), min(col)
+    ├─ match R{run}_{row}_{col}_{mag}X.{tif,bmp,png,jpg}   (unmatched files still load)
+    ├─ grid origin = min(row), min(col) among placeable tiles
     └─ place each tile: origin = (col−col0)×W×(1−overlap), same for row
             │
-            ▼  (ProcessPoolExecutor, one TIFF per worker)
+            ▼  (ThreadPoolExecutor, one image per worker)
     load RGB → gray → float32
             │
             ▼  preprocessing (corrections.py)
@@ -100,26 +106,34 @@ TIFF folder
     invert if particles are dark
             │
             ▼
-    local SNR (FFT residuals only) → soften region borders
+    local SNR (FFT residuals only) → compact-island mask
+            │
+            ▼
+    soften region borders (islands keep ≥0.85 of the ramp)
             │
             ▼
     scale to [0, 1] → zero below min_prominence
             │
             ▼
-    DoG blobs (OpenCV Gaussians; LoG if blob_method: log)
+    DoG blobs + island-centroid seeds (OpenCV Gaussians; LoG if blob_method: log)
             │
             ▼  per-blob gates
-    size window · measured ECD · area · edge distance · circularity
-    local peak on preprocessed tile · compact support
+    size window · measured ECD · prominence · min_confidence
+    edge distance (skipped on islands) · circularity
+    local peak on preprocessed tile (skipped on islands) · compact support
             │
-            ▼  among remaining blobs
+            ▼  among remaining blobs  (order can swap with ML)
     drop clustered neighbours · drop long axis-aligned rows
+            │
+            ▼  optional ml.enabled
+    ExtraTrees HOG (± CNN on uncertain band)
             │
             ▼
     map (x, y, diameter) to global nm · tag source_tile
             │
             ▼  after all tiles
-    KD-tree merge (overlap duplicates) → id 1…N
+    KD-tree merge (overlap duplicates)
+    N/S/E/W + particles_only → directional merge (at most one hit per direction)
             │
             ├─ particles.csv
             └─ downsample thumbnails → stitch → red circles → mosaic_overlay.jpg
@@ -129,12 +143,16 @@ Implemented in `src/pipeline/runner.py`. Modules:
 
 | Step | Module | Role |
 |------|--------|------|
-| Find tiles | `src/io/tile_loader.py` | Regex match, optional run/mag filters, skip column 0, RGB→gray |
+| Find tiles | `src/io/tile_loader.py` | Regex match, optional run/mag filters, unmatched files, RGB→gray |
 | Place tile | `src/stitching/stitcher.py` | Top-left mosaic origin from `row`/`col` and `overlap_fraction` |
 | Preprocess | `src/preprocessing/corrections.py` | Denoise, flatten, stretch; stay **float32** |
-| Detect | `src/detection/detector.py` | Lattice out, compact high-prominence residual, DoG, filters |
-| Measure | `src/measurement/measurer.py` | Local px → global nm; cluster nearby hits across tiles |
+| Detect | `src/detection/detector.py` | Lattice out, islands, compact high-prominence residual, DoG, filters |
+| ML | `src/ml/infer.py` | Optional ExtraTrees / cascade CNN on detector hits |
+| Measure | `src/measurement/measurer.py` | Local px → global nm; cluster nearby hits; N/S/E/W merge |
+| NSEW combine | `src/nsew.py` | Four lighting angles → combi / particles-only / symmetry maps |
 | Report | `src/report/report_generator.py` | Stats, markers, JPEG from cached thumbnails. UI: `app.py` |
+
+Default order is **gates → structure filters → ML**. Set `ml.score_before_structure: true` to score gated DoG hits first, then cluster/line-filter the ML survivors (can add lattice neighbours that cluster-kill isolated flakes). `config.yaml` keeps this **false**.
 
 ---
 
@@ -145,35 +163,38 @@ Implemented in `src/pipeline/runner.py`. Modules:
 Default pattern (`filename_pattern`):
 
 ```
-R(?P<run>\d+)_(?P<row>\d+)_(?P<col>\d+)_(?P<mag>[\d.]+)X\.tiff?
+R(?P<run>\d+)_(?P<row>\d+)_(?P<col>\d+)_(?P<mag>[\d.]+)X\.(?:tiff?|bmp|png|jpe?g)
 ```
 
-Example: `R3_5_32_5X.tif` → run 3, row 5, column 32, 5×. Matching is case-insensitive. `.tif` and `.tiff` both work.
+Example: `R3_5_32_5X.tif` → run 3, row 5, column 32, 5×. Matching is case-insensitive. `.tif`, `.tiff`, `.bmp`, `.png`, `.jpg`, and `.jpeg` all work.
 
 Optional sidebar / config filters:
 
 - `run` — keep only that run (empty = all).
 - `magnification` — keep only that mag (empty = all).
-- **Column 0 is always skipped** (`R3_2_0_5X.tif` and similar sit outside this wafer grid).
+
+Column 0 is **not** dropped. If `R3_2_0_5X.tif` is in the folder it is loaded. The mosaic origin is the **smallest row and column present**, so unused column 0 does not reserve empty space.
+
+The pipeline also loads files that **do not** match the pattern (`include_unmatched=true`). Those tiles are detected but not placed on the mosaic (typical for `N.bmp` / `S.bmp` / `particles_only_2of4.bmp`).
 
 If the pattern also has named groups `x` and `y`, those are used as the mosaic origin in pixels instead of the row/col grid.
 
-The input folder is resolved from several places (`resolve_input_dir`): the given path, the current working directory, `particle_detection/`, and the parent workspace (where folders like `R3 04-08` live). Relative paths in `config.yaml` such as `../Single image test` therefore work from the app or from tests.
+Bare folder names such as `R3 04-08` are resolved under `ASML SE/Inputs` (`resolve_input_dir`). Relative paths that start with `.` or `..` are resolved from `particle_detection/`. Absolute paths are used as-is.
 
 ### Load
 
-`tifffile.imread` reads the TIFF. Extra channels are dropped immediately:
+TIFF uses `tifffile.imread`. BMP / PNG / JPEG use OpenCV. Extra channels are dropped immediately:
 
 - RGB / RGBA uint8 → OpenCV `COLOR_RGB2GRAY`
 - other 3-channel → Rec. 601 weights `(0.299, 0.587, 0.114)`
 
 Detection is intensity-based; colour is never used after this point.
 
-Tile **height and width** for mosaic planning come from the TIFF **header** (`peek_tile_hw`) without decoding pixels, so the grid can be laid out before any worker starts.
+Tile **height and width** for mosaic planning come from the file **header** (`peek_tile_hw`) without decoding pixels, so the grid can be laid out before any worker starts.
 
 ### Placement
 
-A regular grid with fractional overlap (default `overlap_fraction: 0.1` = 10%):
+A regular grid with fractional overlap (current `overlap_fraction: 0.0` = no assumed overlap):
 
 ```
 step_x = tile_width  × (1 − overlap)
@@ -183,7 +204,7 @@ x0 = (col − col_origin) × step_x
 y0 = (row − row_origin) × step_y
 ```
 
-`row_origin` / `col_origin` are the **smallest row and column present in the folder**, so the mosaic does not reserve empty space for unused column 0. Origins are rounded to integer pixels (`TilePlacement.x0`, `y0`).
+`row_origin` / `col_origin` are the **smallest row and column present in the folder**. Origins are rounded to integer pixels (`TilePlacement.x0`, `y0`).
 
 This is **filename-grid placement**, not feature-based registration. If the stage overlap is not `overlap_fraction`, global positions and de-duplication will drift.
 
@@ -199,7 +220,7 @@ Integer images (typical microscope uint8 / uint16) are divided by their max so v
 
 ### Gaussian denoise (`denoise_sigma`, default 1 px)
 
-A small blur so blob detection does not fire on sensor speckle. Too large a sigma also rounds off real particles and merges close neighbours; 1 px is a noise filter, not a smoother.
+A small blur so blob detection does not fire on sensor speckle. Too large a sigma also rounds off real particles and merges close neighbours; 1 px is a noise filter, not a smoother. NSEW overlay uses **0.5 px**.
 
 ### Illumination flatten (`flatten_sigma`, default 160 px)
 
@@ -241,7 +262,7 @@ Concrete steps (`suppress_periodic_fft` / `_notch_mask_from_spectrum`):
 
 **Fallback.** Mixed-layout tiles often have **no FFT peaks** above the threshold. An empty notch would leave the preprocessed image unchanged, and DoG would then fire on every pad corner and grain. If the mask is empty, the detector **falls back to white top-hat** so compact bright debris is still extracted.
 
-Area **boundaries** are step edges, not a lattice. They survive both methods and are handled in [§5](#5-region-border-attenuation).
+Area **boundaries** are step edges, not a lattice. They survive both methods and are handled in [§6](#6-region-border-attenuation) and [§5](#5-compact-residual-islands).
 
 ### Morphological white top-hat (`method: tophat`, and the FFT fallback)
 
@@ -286,9 +307,38 @@ After SNR and edge softening, the residual is scaled to `[0, 1]` again. Values b
 
 Bright compact particles stay. Mesh nodes, grain, and weak ringing do not become candidates. Raise this to drop texture; lower it (toward 0) to pick up dimmer specks. `0` disables the floor.
 
+`config.yaml` currently omits this key; the detector and sidebar still default to **0.30**. NSEW overlay sets it explicitly.
+
+A separate **`min_confidence` (0.50)** gate later requires the residual at the DoG peak to be at least that high. Prominence zeros the map; confidence is the keep/drop on the peak value.
+
 ---
 
-## 5. Region-border attenuation
+## 5. Compact residual islands
+
+Pad-edge softening zeros a wide band around layout ridges, which also erases real flakes that sit *on* a single die step. After the residual is scaled, `_compact_island_protect` finds connected components at the prominence threshold and marks a subset as **protected**.
+
+Keep a component when all of these hold:
+
+1. Equivalent circular diameter ≥ `island_min_nm` (default **20 µm**).
+2. Bounding-box aspect ≤ `island_max_aspect` (default **3**).
+3. Fill (area / box) ≥ `island_min_solidity` (default **0.35**).
+4. Optional morphological open (`island_open_px`, default **4**) so thin ridges do not count as islands.
+
+Then:
+
+- Diameter ≥ `island_large_nm` (default **40 µm**) → **always** protected, even at an L-junction / pad corner.
+- Diameter ≥ 20 µm but &lt; 40 µm → protected only if the preprocessed image is **not** an orthogonal (L) junction at the centroid. Pad corners stay unmasked.
+
+Protected pixels:
+
+- Keep at least **0.85** of the edge-soften ramp (the flake is not multiplied down to zero).
+- Skip the hard `edge_exclude_px` drop.
+- Skip the local-peak SNR test on the preprocessed photo.
+- Have their **centroids seeded into DoG** at σ = ECD / (2√2), then overlap-pruned with ordinary DoG peaks. If the residual max is below `blob_threshold`, only these seeds are used.
+
+---
+
+## 6. Region-border attenuation
 
 Pad corners and box rims look like round debris after top-hat / DoG. A narrow dip *on* the gradient ridge just moves the DoG peak **inside** the box, so the pipeline attenuates a **wide band** around every long coarse border.
 
@@ -299,7 +349,7 @@ Computed on the **preprocessed tile**, not the residual (the residual has alread
 1. Heavy Gaussian blur (`edge_soften_sigma`, default **12 px**) so lattice / texture is ignored and only region-scale steps remain.
 2. Sobel gradient magnitude.
 3. **Hysteresis:** strong pixels (≥ max(12% of the 99.5th percentile, a MAD-based floor)) seed connected components of weaker pixels (≥ 4% of the peak). Weaker pad borders that connect to stronger corners still count; isolated speckle does not.
-4. Keep only components that are **long or thinly filled**: long side ≥ `edge_min_length_px` (default **40**) and (aspect ≥ 2 **or** fill < 0.35). Compact gradient rings around real particles are ignored.
+4. Keep only components that are **long or thinly filled**: long side ≥ `edge_min_length_px` (default **40**) and (aspect ≥ 2 **or** fill &lt; 0.35). Compact gradient rings around real particles are ignored.
 5. Morphological close (7×7 ellipse) to rejoin broken segments, then the length filter again.
 6. **Skeletonize** the mask so distance is to the border *line*, not a fat gradient band (a fat band would swallow real specks sitting inside a pad).
 7. The **tile frame** is forced on (`ridge[0,:]`, last row, first/last column). Truncated pads at the crop edge would otherwise look like particles.
@@ -313,20 +363,21 @@ Computed on the **preprocessed tile**, not the residual (the residual has alread
 margin = max(edge_exclude_px, edge_soften_sigma, 1)
 t      = clip(distance / margin, 0, 1)
 ramp   = smoothstep(t) ^ strength     # smoothstep = t² (3 − 2t)
+if protect: ramp = max(ramp, 0.85)
 residual ← residual × ramp
 ```
 
-Default `edge_soften_strength: 2` and `edge_exclude_px: 48`. The ramp goes to zero **on** the border and recovers over ~48 px, so DoG cannot bead in the ringing band just inside a box.
+Default `edge_soften_strength: 2` and `edge_exclude_px: 12`. The ramp goes to zero **on** the border and recovers over ~12 px (or 12 px of blur, whichever is larger). Islands keep most of their residual.
 
 Set `edge_soften_strength` to 0 to leave the residual unchanged (the hard distance gate below can still drop blobs).
 
 ### Hard exclude
 
-After DoG, any hit whose distance to the skeleton is **≤ `edge_exclude_px`** is dropped. No prominence exception: pad *corners* look compact and bright after top-hat, so a “keep bright specks next to borders” rule was keeping layout. Set `edge_exclude_px` to 0 to keep blobs next to borders (you will get pad corners).
+After DoG, any hit whose distance to the skeleton is **≤ `edge_exclude_px`** is dropped, **unless it sits on a protected island**. Pad *corners* look compact and bright after top-hat; they fail the island L-junction test and still drop. Set `edge_exclude_px` to 0 to keep blobs next to borders (you will get pad corners).
 
 ---
 
-## 6. Blob detection (difference of Gaussians)
+## 7. Blob detection (difference of Gaussians)
 
 Default `blob_method: dog` uses `blob_dog_fast`, an OpenCV implementation of the same scale convention as `skimage.feature.blob_dog`. (`blob_method: log` calls `skimage.feature.blob_log` instead.)
 
@@ -345,12 +396,13 @@ Defaults at **0.96 µm/px**:
 
 | Config | Sigma | Diameter (px) | Physical |
 |--------|-------|----------------|----------|
-| `blob_min_sigma` | 3.7 | ≈ 10.4 | **10 µm** |
+| `blob_min_sigma` | 3.7 | ≈ 10.4 | **10 µm** (search floor) |
 | `blob_max_sigma` | 36 | ≈ 102 | **100 µm** |
+| `min_size_nm` | — | ≈ 20.8 | **20 µm** (keep floor) |
 
 `tophat_radius: 50` must stay larger than the biggest flake or the flake never reaches DoG.
 
-If you change `min_size_nm` / `max_size_nm`, change the matching `blob_min_sigma` / `blob_max_sigma` (and top-hat radius) or the detector hunts for the wrong scales and the size gate throws the hits away.
+If you change `min_size_nm` / `max_size_nm`, change the matching `blob_min_sigma` / `blob_max_sigma` (and top-hat radius) or the detector hunts for the wrong scales and the size gate throws the hits away. Do **not** raise `blob_min_sigma` to 7.4 just because the product floor is 20 µm: that flooded layout FPs on R4 and dropped recall below 95%.
 
 ### Scale sampling
 
@@ -362,7 +414,7 @@ Sigmas are a geometric series:
 
 until `σ ≥ blob_max_sigma`. Default `blob_sigma_ratio: 1.4`. If you set `blob_num_sigma` instead (used by LoG, and as a fallback to derive the ratio), the ratio becomes `(max/min)^(1/(n−1))`.
 
-Each pair of adjacent Gaussians is subtracted and multiplied by `1 / (ratio − 1)` so responses are comparable across scales. A pixel is a peak if it is ≥ its 8-neighbours **and** ≥ the dilated previous/next scale **and** ≥ `blob_threshold` (default **0.08** after prominence scaling).
+Each pair of adjacent Gaussians is subtracted and multiplied by `1 / (ratio − 1)` so responses are comparable across scales. A pixel is a peak if it is ≥ its 8-neighbours **and** ≥ the dilated previous/next scale **and** ≥ `blob_threshold` (default **0.12** after prominence scaling).
 
 Overlapping peaks: if two circles overlap by more than 0.5 (fraction of the smaller diameter, or full containment), the **smaller-sigma** blob is dropped.
 
@@ -370,9 +422,9 @@ Gaussians for DoG are computed at **full resolution** (`_gaussian_blur_full`) so
 
 ---
 
-## 7. Per-blob filters
+## 8. Per-blob filters
 
-Each DoG peak is converted to a candidate only if it passes **all** of the following. Order matches `detect_particles`.
+Each DoG peak is converted to a candidate only if it passes **all** of the following. Order matches `_gate_blob`.
 
 ### Size window and measured diameter
 
@@ -386,17 +438,21 @@ The DoG diameter `2√2 σ` is still used as a coarse scale gate so the detector
 
 If the connected support is empty, the pipeline falls back to the DoG diameter.
 
-Defaults: **10–100 µm**. At 0.96 µm/px that is about 10.4–104 px.
+Defaults: **20–100 µm**. At 0.96 µm/px that is about 20.8–104 px. `min_area_px: 4` is an absolute area floor on both the DoG disk and the measured ECD.
 
 ### Prominence at the peak
 
 The residual value at the rounded `(y, x)` must still be ≥ `min_prominence`. (The map was already zeroed below that floor; this catches numerical leftovers.)
 
+### Confidence (`min_confidence`, default 0.50)
+
+Same residual value must also be ≥ `min_confidence`. This is the main intensity keep/drop after 0–1 scaling. `0` disables.
+
 ### Edge distance
 
-`coarse_edge_distance[y, x] ≤ edge_exclude_px` → drop. Pad corners, box rims, and the tile frame sit here.
+`coarse_edge_distance[y, x] ≤ edge_exclude_px` → drop, unless the pixel is on a **protected island**. Pad corners, box rims, and the tile frame sit here.
 
-### Circularity (`min_circularity`, default 0.30)
+### Circularity (`min_circularity`, default 0.0 = off)
 
 Inertia-ratio of the local residual mass in a window of half-width `3 × radius`:
 
@@ -404,47 +460,48 @@ Inertia-ratio of the local residual mass in a window of half-width `3 × radius`
 2. Compute the 2×2 covariance of that mass.
 3. Circularity = `λ_min / λ_max` of that tensor.
 
-**1** = round, **0** = line-like. Only very elongated rim beads fail. Labeled debris is irregular (median circularity ~0.51); letters and fiducials are often *rounder*, so raising this floor keeps layout and drops potato-shaped flakes. `0` disables.
+**1** = round, **0** = line-like. Labeled debris is irregular (median circularity ~0.51); letters and fiducials are often *rounder*, so raising this floor keeps layout and drops potato-shaped flakes. Leave it at **0**.
 
 ### Local peak on the *preprocessed* tile
 
-Top-hat and flattening can leave residual peaks on empty dark field that are not particles. The centre of a `3 × radius` window on the **preprocessed intensity** (not the residual) must exceed the local median by **2.5 × MAD**. If `particles_bright` is false, the test is inverted (must be a local dark extremum).
+Top-hat and flattening can leave residual peaks on empty dark field that are not particles. The centre of a `3 × radius` window on the **preprocessed intensity** (not the residual) must exceed the local median by **2.5 × MAD**. If `particles_bright` is false, the test is inverted (must be a local dark extremum). **Skipped on protected islands.**
 
 ### Compact support
 
 Count residual pixels in the same window that are ≥ `0.4 ×` centre. Plateaus and line segments fill most of the window; compact particles do not. Drop if that count exceeds `max_support_area_px`, or if that key is 0 / unset, **`6 ×` the blob’s disk area**. Layout pads that DoG reports at a small sigma fail this.
 
-### Confidence
+### Confidence (stored)
 
-The residual intensity at the blob centre (0–1 after scaling and the prominence floor). Used later to pick the winner when overlap tiles report the same particle.
+The residual intensity at the blob centre (0–1 after scaling and the prominence floor). Used later to pick the winner when overlap tiles (or N/S/E/W views) report the same particle.
 
 ---
 
-## 8. Spatial structure filters
+## 9. Spatial structure filters
 
-Applied to the **set** of survivors on this tile, not to each blob in isolation.
+Applied to the **set** of survivors on this tile, not to each blob in isolation (`apply_structure_filters`).
 
 ### Neighbour / cluster filter (`reject_clustered_candidates`)
 
 Isolated particles have no nearby hits. Region-border beads and repeating layout cells have several.
 
 - Build a KD-tree of candidate centres.
-- Drop a blob if it has **`structure_min_neighbors`** or more *other* blobs within `structure_neighbor_px` (defaults: **2** neighbours, **48 px**), **unless** it is a size/SNR outlier versus those neighbours (equivalent diameter ≥ 1.6× the neighbour median, or local-peak SNR ≥ 2.5×). That keeps a ~30–50 µm flake sitting in a scatter of ~15 µm layout nodes.
+- Drop a blob if it has **`structure_min_neighbors`** or more *other* blobs within `structure_neighbor_px` (defaults: **2** neighbours, **48 px**), **unless** it is a size/SNR outlier versus those neighbours (equivalent diameter ≥ `structure_size_ratio` × the neighbour median, default **1.30×**, or local-peak SNR ≥ **2.5×**). That keeps a ~20 µm flake sitting in a scatter of ~13 µm layout nodes.
 - `structure_neighbor_px: 0` disables.
 
-Equal-sized lattice nodes still drop as a group. Turning the count threshold off entirely still produces tens of thousands of hits.
+Equal-sized lattice nodes still drop as a group.
 
 ### Axis-aligned chain filter (`reject_axis_aligned_chains`)
 
 Leftover “frame just inside the box”: a row or column of blobs along a pad rim that the neighbour radius did not fully catch.
 
 - Bin `y` (then `x`) to `structure_line_bin_px` (default **10 px**).
-- If a bin contains ≥ `structure_line_min_run` blobs (default **3**) whose span in the other axis is ≥ `structure_line_min_span_px` (default **48 px**), drop members of that run that are **not** size outliers (≥ 1.6× the run median). A large flake in a column of small rim beads is kept; a row of similar pad corners is not.
-- `structure_line_bin_px: 0` disables.
+- If a bin contains ≥ `structure_line_min_run` blobs (default **3**) whose span in the other axis is ≥ `structure_line_min_span_px` (default **48 px**), drop members of that run that are **not** size outliers (≥ 1.30× the run median).
+- A run with a hole larger than `structure_line_max_gap_px` (default **48 px**) is **not** treated as a frame. That stops two unrelated flakes that happen to share a 10 px band from killing each other.
+- `structure_line_bin_px: 0` disables. `structure_line_max_gap_px: 0` skips the hole check.
 
 ---
 
-## 9. Global coordinates and de-duplication
+## 10. Global coordinates and de-duplication
 
 For each surviving candidate (`measure_candidates`):
 
@@ -454,14 +511,14 @@ mosaic_y_px = tile.y0 + y_local
 
 x_global = mosaic_x_px × pixel_size_nm     # nanometres
 y_global = mosaic_y_px × pixel_size_nm
-size     = ECD_px × pixel_size_nm     # equivalent circular diameter, nm
+size     = ECD_px × pixel_size_nm          # equivalent circular diameter, nm
 ```
 
-`source_tile` is the TIFF filename. `id` is 0 until the merge step.
+Unplaced tiles (no row/col in the filename) use origin `(0, 0)`. `source_tile` is the filename. `id` is 0 until the merge step.
 
 ### Overlap merge (`deduplicate`)
 
-Overlapping tiles can report the same particle twice. Merge radius:
+Overlapping *grid* tiles can report the same particle twice. Merge radius:
 
 ```
 merge_radius_nm = merge_radius_px × pixel_size_nm
@@ -476,24 +533,37 @@ Default `merge_radius_px: 8` ≈ **7.7 µm** at 0.96 µm/px.
 5. Cluster **size** is `max` or `mean` of members (`size_aggregation`, default **max** — the most complete view of a flake that was clipped on one tile).
 6. Assign `id` 1…N in the order kept (highest confidence first).
 
-`merge_radius_px: 0` skips clustering and only renumbers.
+`merge_radius_px: 0` skips clustering and only renumbers (unless a size-match fraction is set).
+
+### N/S/E/W merge (`deduplicate_nsew`)
+
+Hits whose `source_tile` stem is `N`, `S`, `E`, `W`, or `particles_only…` are merged **separately** with `directional=True`:
+
+- Search radius is `max(merge_radius_px, nsew_merge_radius_px)` (default extra **24 px**) times `pixel_size_nm`.
+- Two hits also merge if they are closer than `nsew_size_match_fraction` × the **larger** diameter (default **0.4**). Directional views of the same flake can sit farther apart than 8 px.
+- At most **one member per direction / particles-only version**. Two hits on the same `N.bmp` never merge with each other through this path.
+- `nsew_count` / `nsew_dirs` record which lighting angles contributed (`N,S,E` etc.).
+
+Placeable grid tiles and unmatched directional files are concatenated after their own merges, then `id` is reassigned 1…N.
 
 ---
 
-## 10. Outputs and the mosaic overlay
+## 11. Outputs and the mosaic overlay
 
 ### CSV
 
-Written to `{output_dir}/particles.csv`. Columns:
+Written to `{output_dir}/particles.csv`. Bare output names such as `Recall audit` become `ASML SE/Outputs/Recall audit`. Columns:
 
 | Column | Unit | Meaning |
 |--------|------|---------|
 | `id` | — | 1…N after merge |
-| `x_global` | nm | Mosaic X from the top-left of the grid |
+| `x_global` | nm | Mosaic X from the top-left of the grid (0 for unplaced tiles) |
 | `y_global` | nm | Mosaic Y, **down** (image convention) |
 | `size` | nm | Equivalent circular diameter from the photo footprint × `pixel_size_nm` |
 | `confidence` | 0–1 | Residual at the peak |
 | `source_tile` | filename | Tile that supplied the winning (highest-confidence) hit |
+| `nsew_count` | count | Distinct N/S/E/W / particles-only members in the merge (0 for grid-only) |
+| `nsew_dirs` | text | Those stems, comma-separated |
 | `circularity` | 0–1 | Inertia-ratio circularity of the residual mass |
 | `support_over_area` | — | Residual support pixels / DoG disk area |
 | `edge_distance_px` | px | Distance to the nearest coarse region border |
@@ -502,11 +572,11 @@ Written to `{output_dir}/particles.csv`. Columns:
 | `local_peak_snr` | — | Peak vs local median, MAD-scaled |
 | `radial_inner` / `radial_mid` / `radial_outer` | 0–1 | Mean residual in rings 0–0.5R / 0.5–1R / 1–1.5R |
 
-The UI also shows `size_um` = `size / 1000`. The CSV itself stays in nm. The extra columns are features for the optional sklearn post-filter; they are computed from the residual at detection time, not from labeled crop JPEGs.
+The UI also shows `size_um` = `size / 1000`. The CSV itself stays in nm. Feature columns are computed from the residual at detection time, not from labeled crop JPEGs.
 
 ### Mosaic overlay
 
-Detection never builds a full-resolution stitch. During the detection pass, if the overlay will be downsampled by a factor `f > 1`, each worker also emits an `INTER_AREA` thumbnail (`H/f × W/f`). `LazyMosaic` later pastes those thumbnails onto one canvas.
+Detection never builds a full-resolution stitch. During the detection pass, if the overlay will be downsampled by a factor `f > 1`, each worker also emits an `INTER_AREA` thumbnail (`H/f × W/f`). `LazyMosaic` later pastes those thumbnails onto one canvas. Unplaced tiles do not appear on the stitch.
 
 Downsample factor (`overlay_downsample`):
 
@@ -534,6 +604,8 @@ Later tiles overwrite earlier ones in overlap; there is no blending. That is fin
 
 Typical 5× tiles: **`pixel_size_nm: 960`** → **1 pixel = 0.96 µm**.
 
+Groundup / N/S/E/W images use **`pixel_size_nm: 3500`** (3.5 µm/px) via **Apply NSEW settings**.
+
 The UI talks in **µm**. The CSV and internal config talk in **nm**. Sidebar conversions: `nm = µm × 1000`.
 
 Useful conversions at 0.96 µm/px:
@@ -542,32 +614,51 @@ Useful conversions at 0.96 µm/px:
 |----------|--------|------------------------|
 | 10 µm | 10.4 | 3.7 |
 | 15 µm | 15.6 | 5.5 |
+| 20 µm | 20.8 | 7.4 |
 | 32 µm | 33.3 | 11.8 |
 | 50 µm | 52.1 | 18.4 |
 | 100 µm | 104.2 | 36.8 |
 | merge 8 px | 7.7 µm | — |
-| edge exclude 48 px | 46 µm | — |
+| NSEW merge 24 px | 23 µm | — |
+| edge exclude 12 px | 11.5 µm | — |
 | top-hat radius 50 | objects ≲ 100 px survive | — |
 
 If you change magnification, set `pixel_size_nm` first, then recompute sigmas and size bounds from the physical window you care about.
 
 ---
 
+## NSEW directional lighting
+
+Four images of the **same field** named `N`, `S`, `E`, `W` (any common suffix) under a folder. The **NSEW** tab (`src/nsew.py`) does **not** run DoG. It:
+
+1. Flatten each angle with a Gaussian (σ **120**, local to this combine step).
+2. For min-count **2, 3, and 4 of 4**, score pixels that are bright in at least that many angles (`symmetry_signal_4way`).
+3. Write, at the same pixel size as the inputs:
+   - `Combi/combi_{k}of4.*` — isotropic brightness
+   - `Particles only/particles_only_{k}of4.*` — Otsu + shape-filtered mask of compact blobs
+   - `Symmetry/symmetry_map_{k}of4.*` — symmetry score
+
+Outputs go to `Outputs/Output {folder name}/`. 2-of-4 is also written without the `_2of4` suffix.
+
+Detection of those combined images (and of the four raw angles) uses the main pipeline. **Apply NSEW settings** merges `nsew_config.yaml` on top of `config.yaml`: 3.5 µm/px, denoise σ 0.5, `blob_min_sigma` 9, `blob_threshold` 0.3, ML threshold **0.55**, same v5 model.
+
+---
+
 ## Parameter reference
 
-Defaults below are from `config.yaml`. The Streamlit sidebar exposes most of them; keys only in YAML are marked *YAML only*.
+Defaults below are from current `config.yaml` unless noted. The Streamlit sidebar exposes most of them; keys only in YAML are marked *YAML only*. `min_prominence` is a code/sidebar default (not currently in YAML).
 
 ### Data / grid
 
 | Key | Default | Role |
 |-----|---------|------|
-| `input_dir` | (path) | Folder of TIFF tiles |
-| `output_dir` | `output` | CSV + JPEG destination |
-| `filename_pattern` | `R(?P<run>…)_(?P<row>…)_(?P<col>…)_(?P<mag>…)X\.tiff?` | Named groups for placement |
+| `input_dir` | (path) | Folder of tiles under `Inputs/` or an absolute path |
+| `output_dir` | (path) | CSV + JPEG destination under `Outputs/` |
+| `filename_pattern` | `R(?P<run>…)_(?P<row>…)_(?P<col>…)_(?P<mag>…)X\.(tiff?\|bmp\|png\|jpe?g)` | Named groups for placement |
 | `run` / `magnification` | empty | Optional filters |
-| `overlap_fraction` | 0.10 | Assumed stage overlap |
+| `overlap_fraction` | 0.0 | Assumed stage overlap (0 = tiles abut) |
 | `pixel_size_nm` | 960 | 1 px = 0.96 µm on these 5× tiles |
-| `pipeline.workers` | 0 | 0 = all cores; each process uses 1 OpenCV thread |
+| `pipeline.workers` | 0 | 0 = all cores; thread pool, 1 OpenCV thread when parallel |
 
 ### Preprocessing
 
@@ -589,62 +680,80 @@ Defaults below are from `config.yaml`. The Streamlit sidebar exposes most of the
 | `fft_peak_threshold` | 0.35 | Lower = notch more (may eat real structure). Higher = leave lattice in. |
 | `fft_notch_radius` | 3 *YAML* | Dilate each spectral peak before zeroing. |
 | `fft_mask` | `per_tile` | `shared` only if every tile has the same pitch. |
-| `tophat_radius` | 50 | **Must exceed the largest particle** (px). 50 ≈ 100 µm flakes. |
+| `tophat_radius` | 50 | **Must exceed the largest particle** (px). 50 ≈ 100 µm flakes at 0.96 µm/px. |
 
 ### Blob / size
 
 | Key | Default | Notes |
 |-----|---------|--------|
 | `blob_method` | `dog` *YAML* | `log` = slower scikit-image LoG |
-| `min_size_nm` / `max_size_nm` | 10000 / 100000 | 10–100 µm. Raise `blob_*_sigma` and `tophat_radius` with these. |
+| `min_size_nm` / `max_size_nm` | 20000 / 100000 | **20–100 µm** keep window. DoG search still starts at σ 3.7. |
 | `blob_min_sigma` / `blob_max_sigma` | 3.7 / 36 | Scale window; see table above |
 | `blob_num_sigma` | 5 *YAML* | LoG levels; also derives ratio if `blob_sigma_ratio` unset |
 | `blob_sigma_ratio` | 1.4 *YAML* | Geometric step between DoG scales |
-| `blob_threshold` | 0.08 | DoG peak height after 0–1 scaling. Lower = more candidates. |
+| `blob_threshold` | 0.12 | DoG peak height after 0–1 scaling. Lower = more candidates. |
 | `min_area_px` | 4 *YAML* | Absolute area floor (DoG disk and measured ECD) |
 | `size_mass_fraction` | 0.4 *YAML* | Photo contrast vs local background that counts as particle area |
-| `min_prominence` | 0.30 | Zero residual below this before DoG. 0 disables. |
+| `min_prominence` | 0.30 (code) | Zero residual below this before DoG. 0 disables. |
+| `min_confidence` | 0.50 | Drop if residual-at-peak is below this. |
 
-### Residual / edges
+### Islands / residual / edges
 
 | Key | Default | Notes |
 |-----|---------|--------|
+| `island_min_nm` | 20000 *YAML* | Smallest island ECD (nm) that can be protected |
+| `island_large_nm` | 40000 *YAML* | Always protect at this ECD, even on L-junctions |
+| `island_max_aspect` | 3 *YAML* | Drop elongated residual components |
+| `island_min_solidity` | 0.35 *YAML* | area / bounding box |
+| `island_open_px` | 4 *YAML* | Morphological open before labelling |
 | `local_snr_sigma` | 0 | 0 = auto on FFT (`3.5 × blob_max_sigma`), off for top-hat. Negative = off always. |
 | `edge_soften_sigma` | 12 | Coarse blur before the region-border gradient. 0 disables distance. |
 | `edge_soften_strength` | 2 | How hard to ramp residual to 0 near borders. 0 = no ramp. |
-| `edge_exclude_px` | 48 | Hard drop if distance ≤ this. 0 keeps blobs next to borders. |
+| `edge_exclude_px` | 12 | Hard drop if distance ≤ this (except protected islands). 0 keeps border blobs. |
 | `edge_min_length_px` | 40 *YAML* | Ignore compact gradient rings shorter than this. |
 
 ### Shape / structure
 
 | Key | Default | Notes |
 |-----|---------|--------|
-| `min_circularity` | 0.30 | Drop very elongated hits only. Labeled debris is irregular; do not raise this to reject letters. 0 keeps every blob. |
+| `min_circularity` | 0.0 | 0 keeps every blob. Do not raise this to reject letters. |
 | `max_support_area_px` | 0 *YAML* | 0 → cap at `6 × π r²`. Layout pads exceed this. |
 | `structure_neighbor_px` | 48 | Drop blobs with ≥ `structure_min_neighbors` others this close. 0 disables. |
 | `structure_min_neighbors` | 2 *YAML* | |
+| `structure_size_ratio` | 1.30 *YAML* | Keep a clustered blob if size ≥ this × neighbour median |
 | `structure_line_bin_px` | 10 *YAML* | Row/column binning for frame filter. 0 disables. |
 | `structure_line_min_run` | 3 *YAML* | |
 | `structure_line_min_span_px` | 48 *YAML* | |
-| `recall_mode` | false | Loosen edge/confidence/circularity for ML proposals. Cluster filters stay on. |
-| `recall.*` | conf 0.40, circ 0.0, edge 12 | Overlay when `recall_mode` is true. 0.40 recovers dim 15 µm flakes that 0.75 dropped. |
+| `structure_line_max_gap_px` | 48 *YAML* | Hole larger than this → not a frame |
+
+`detection.recall_mode` and `detection.recall.*` are **unused**. `with_recall_profile()` is a no-op. Edge 12 / confidence 0.50 / circularity 0 are the standard gates.
 
 ### ML
 
 | Key | Default | Notes |
 |-----|---------|--------|
-| `ml.enabled` | false | Score proposals with ExtraTrees. Off until a model is trained. |
-| `ml.model_path` | `models/particle_clf.joblib` | Relative to `particle_detection/`. |
-| `ml.threshold` | 0.25 | Keep blobs with `P(particle)` ≥ this. From the last ExtraTrees train (95% labeled recall). Lower = more recall. |
+| `ml.enabled` | true | Score proposals. Raises if the joblib is missing. |
+| `ml.model_path` | `models/particle_clf_v5.joblib` | Relative to `particle_detection/`. Versioned; do not overwrite a vN file. |
+| `ml.threshold` | 0.0165 | Keep blobs with `P(particle)` ≥ this (v5 keep-all on R4 holdout). NSEW overlay uses **0.55**. |
+| `ml.score_before_structure` | false | true = ML then cluster/line. false = cluster/line then ML. |
+| `ml.band_low` / `band_high` | 0.20 / 0.80 | Fallbacks if a cascade joblib has no stored band. CNN replaces HOG only inside the band. |
 
 ### Measurement / report
 
 | Key | Default | Notes |
 |-----|---------|--------|
-| `merge_radius_px` | 8 | Overlap de-dupe. 0 = no merge. |
+| `merge_radius_px` | 8 | Overlap de-dupe. 0 = no merge (grid tiles). |
 | `size_aggregation` | `max` | `max` or `mean` of a merged cluster |
+| `nsew_size_match_fraction` | 0.4 *YAML* | Merge directional hits closer than this × larger diameter |
+| `nsew_merge_radius_px` | 24 *YAML* | Extra search radius (px) for N/S/E/W pairing |
 | `target_mb` | 20 | Uncompressed RGB budget for the stitch |
 | `downsample` | 0 | 0 = derive from `target_mb`; `> 0` forces that integer factor |
+
+### Labeling
+
+| Key | Default | Notes |
+|-----|---------|--------|
+| `labeling.source_csv` | `recall/particles.csv` | Label tab prefers this `particles.csv` under `Outputs/`, then falls back |
 
 ---
 
@@ -654,14 +763,15 @@ Work from the **symptom**, not from every slider at once. After a change, re-run
 
 **Too many hits on the lattice / grain**
 
-- Raise `min_prominence` (0.30 → 0.4–0.5).
+- Raise `min_prominence` (0.30 → 0.4–0.5) or `min_confidence` (0.50 → 0.6+).
 - Raise `fft_peak_threshold` only if the lattice is *not* being notched (you should see it vanish in a residual debug). More often the FFT already worked and prominence is the issue.
 - Raise `blob_threshold`.
 - Confirm `method` is `fft` on periodic tiles.
+- If ML is on, raise `ml.threshold`.
 
 **Pad corners and box rims circled**
 
-- These are the main false-positive class. Confirm `edge_exclude_px` is ~48 (or larger than the pad chamfer) and `edge_soften_sigma` > 0.
+- These are the main false-positive class. Confirm `edge_exclude_px` is at least ~12 and `edge_soften_sigma` > 0. Do not lower `island_large_nm` so far that corners become “large islands”.
 - Do **not** raise `min_circularity` — labeled letters/fiducials are as round as (or rounder than) real flakes. Use edge and structure filters, or the ML layout gate.
 - Raise `structure_neighbor_px` if a chain of rim beads survives as “isolated” pairs.
 
@@ -670,13 +780,14 @@ Work from the **symptom**, not from every slider at once. After a change, re-run
 - `tophat_radius` must be **larger than the flake** (default 50). A 17 px top-hat erases ~100 px debris.
 - `blob_max_sigma` must cover it (36 ≈ 100 µm at 0.96 µm/px).
 - `max_size_nm` must not clip it (100000 = 100 µm).
-- If it sits next to a region border, `edge_exclude_px` may be eating it — inspect a full-res crop before lowering the exclude (lowering it brings pad corners back).
+- If it sits on a region border, island protect should keep ≥40 µm flakes; inspect a full-res crop before lowering `edge_exclude_px` (lowering it brings pad corners back).
 
-**Small specks missing (~10 µm)**
+**Small specks missing (~20 µm)**
 
-- Lower `blob_min_sigma` together with `min_size_nm`.
-- Lower `min_prominence` / `blob_threshold` a little.
+- `min_size_nm` is 20 µm. Lower it together with checking `blob_min_sigma` if you truly want ~10 µm.
+- Lower `min_prominence` / `min_confidence` / `blob_threshold` a little.
 - Check `denoise_sigma` is not much above 1.
+- A 20 µm flake on an L-junction is **not** island-protected.
 
 **Thousands of hits on dark field, then real specks disappear**
 
@@ -685,6 +796,7 @@ Work from the **symptom**, not from every slider at once. After a change, re-run
 **Same particle listed twice**
 
 - Raise `merge_radius_px`, or check `overlap_fraction` matches the stage. If the grid is wrong, duplicates can sit farther apart than 8 px.
+- For N/S/E/W, raise `nsew_merge_radius_px` or `nsew_size_match_fraction`.
 
 **Positions look shifted on the mosaic**
 
@@ -692,33 +804,53 @@ Work from the **symptom**, not from every slider at once. After a change, re-run
 
 **Run is slow (~minutes)**
 
-- Expected: DoG at full resolution plus an FFT or a 50 px top-hat, once per tile, on all cores. `workers: 0` should already use every core. Crops in the UI re-read TIFFs; the overview should use cached thumbnails from the detection pass.
+- Expected: DoG at full resolution plus an FFT or a 50 px top-hat, once per tile, on all cores. `workers: 0` should already use every core (threads). Crops in the UI re-read images; the overview should use cached thumbnails from the detection pass.
 
 ---
 
 ## What this does *not* do
 
-- It does **not** classify particle type (metal, resist, scratch, fibre, etc.). The optional sklearn model only answers particle vs not-particle.
+- It does **not** classify particle type (metal, resist, scratch, fibre, etc.). The optional model only answers particle vs not-particle.
 - It does **not** replace DoG with a neural detector. Changing wafer pitch, magnification, or illumination still means retuning FFT threshold, DoG sigmas, size bounds, and the edge band. Labels are on detector hits, not missed debris.
 - Mosaic stitching is **placement by filename grid + overlap**, not feature-based registration. Stage error becomes global-position error.
 - It does **not** detect on the stitched mosaic. Overlap is handled only by the KD-tree merge after per-tile detection.
-- Strict classical mode does **not** keep particles that sit on a coarse region border or the tile frame. Turn on `detection.recall_mode` to propose those for labeling; the ML gate can then drop pad corners.
+- It does **not** keep pad-corner L-junctions. Compact islands on a *single* edge (≥20 µm) or large flakes (≥40 µm) can survive the border band; corners cannot.
 - It does **not** try to split overlapping real particles. DoG overlap pruning keeps the larger scale; the merge step keeps the higher-confidence seed.
-- It does **not** train on the circled label JPEGs. The red marker would leak into any crop CNN.
+- It does **not** train on the circled label JPEGs. The red marker would leak into any crop CNN. Training reads unmarked TIFF/BMP patches and residual channels.
+- `detection.recall_mode` does **not** switch a looser profile. That overlay was removed; the current YAML *is* the high-recall-ish standard.
 
 ---
 
 ## ML cascade (optional)
 
-DoG remains the only proposal generator. After cheap geometric gates, each blob already has a ~12-float feature vector. `python -m src.ml.train` joins `labels/labels.csv` to a `particles.csv` that contains those columns (GroupKFold by tile, class-weighted ExtraTrees) and writes `models/particle_clf.joblib`. Circled crops under `labels/crops/` are ignored.
+DoG remains the only proposal generator. After cheap geometric gates (and usually after structure filters), each blob is scored.
+
+`python -m src.ml.train` (default `--mode cascade`):
+
+1. Joins `labels/labels.csv` to detections (GroupKFold by tile).
+2. Extracts **unmarked** corrected-image + residual patches (circled crops under `labels/crops/` are ignored).
+3. Trains class-weighted ExtraTrees on HOG / layout features.
+4. Trains a tiny CNN on the **uncertain HOG band** (default 0.20–0.80).
+5. Writes the next `models/particle_clf_v{N+1}.joblib` (never overwrites an existing vN).
+
+`--mode patch` skips the CNN. `--mode residual` is the old detector-float ExtraTrees on CSV columns only.
+
+At inference (`apply_ml_filter`):
+
+- Residual models score the ~12-float vector (`size_um`, `confidence`, circularity, support, edges, neighbours, local-peak SNR, radial rings).
+- Patch / cascade models rebuild unmarked patches on the **corrected tile** in the worker.
+- Cascade: keep HOG `P` outside the band; replace with CNN `P` inside it. Band stored in the joblib wins over `ml.band_low` / `band_high`.
+- Drop blobs with `P(particle) < ml.threshold`.
+
+Scoring a few dozen vectors (or patches) per tile is small next to DoG. `ml.enabled: true` with a missing joblib **raises**; it will not silently run classical-only.
+
+v5 at threshold **0.0165** is a keep-all setting on R4 holdout tiles (bake-off: 39 TP / 77 FP on the frozen winner). NSEW uses a much higher threshold (**0.55**).
 
 Typical loop:
 
-1. Enable **High-recall proposals** (`detection.recall_mode`). FFT/DoG and the size window stay on; edge/confidence/circularity loosen (`detection.recall`). Cluster/grid rejection stays on.
-2. Write the run to `Outputs/recall`. Label only the new hits; existing keys are skipped.
-3. Train. Turn on `ml.enabled` so each worker loads the model once and drops blobs with `P(particle) < ml.threshold`.
-
-Scoring a few dozen vectors per tile is negligible next to DoG. Leave `ml.enabled: false` until a model exists; the default pipeline stays classical.
+1. Run Detection (structure filters on, ML on or off).
+2. **Tinder** tab: label new hits; existing keys (including N/S/E/W aliases) are skipped.
+3. Train a new vN. Point `ml.model_path` at it and set `ml.threshold`.
 
 ---
 
@@ -729,6 +861,15 @@ cd particle_detection
 streamlit run app.py
 ```
 
-Set the tile folder in the sidebar (or `input_dir` in `config.yaml`) and click **Run pipeline**. **Reset to standard values** restores every sidebar widget from `config.yaml`. The **Tiles** tab walks that folder one TIFF at a time: zoom a 3×3 cell, click an unmarked speck, **Mark missed particle**.
+Set the tile folder in the sidebar (or `input_dir` in `config.yaml`) and click **Run pipeline**. **Reset to standard values** restores every sidebar widget from `config.yaml`. **Apply NSEW settings** overlays `nsew_config.yaml`.
+
+| Tab | Use |
+|-----|-----|
+| Detection | Run the pipeline, table, histogram, mosaic crop |
+| NSEW | Combine N/S/E/W lighting into combi / particles-only / symmetry |
+| Tiles | Walk one image at a time; zoom; mark a missed speck |
+| Last Run | Review the last `particles.csv` against labels |
+| Tinder | Label queue from detections |
+| Database | Saved particle / not-particle crops |
 
 Tests live under `tests/` (`pytest`). Synthetic fixtures in `tests/fixtures/synthetic.py` cover lattice tiles, dark-field flakes, and pad corners so the filters have regression locks.

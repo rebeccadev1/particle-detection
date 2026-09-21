@@ -81,7 +81,7 @@ def input_tile_names(config: Mapping[str, Any]) -> set[str]:
         return set()
     pattern = str(cfg_get(dict(config), "filename_pattern", DEFAULT_FILENAME_PATTERN))
     try:
-        paths = matching_tile_paths(folder, pattern)
+        paths = matching_tile_paths(folder, pattern, include_unmatched=True)
     except FileNotFoundError:
         return set()
     return {path.name for path in paths}

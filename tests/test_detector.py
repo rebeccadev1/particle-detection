@@ -527,28 +527,17 @@ def test_pad_corner_stays_dropped_with_island_protect() -> None:
             assert dist > 24.0, "pad corner should not be a particle"
 
 
-def test_recall_mode_relaxes_gates() -> None:
+def test_recall_profile_is_identity() -> None:
     from src.config import with_recall_profile
 
     config = detector_test_config(
         detection={
-            "recall_mode": True,
-            "edge_exclude_px": 48.0,
-            "min_confidence": 0.95,
-            "min_circularity": 0.30,
-            "structure_min_neighbors": 2,
-            "structure_line_bin_px": 10.0,
+            "edge_exclude_px": 12.0,
+            "min_confidence": 0.50,
+            "min_circularity": 0.0,
         }
     )
-    relaxed = with_recall_profile(config)
-    assert relaxed is not config
-    det = relaxed["detection"]
-    assert det["edge_exclude_px"] == 12.0
-    assert det["min_confidence"] == 0.40
-    assert det["min_circularity"] == 0.0
-    assert det["structure_min_neighbors"] == 2
-    assert det["structure_line_bin_px"] == 10.0
-    assert config["detection"]["edge_exclude_px"] == 48.0
+    assert with_recall_profile(config) is config
 
 
 def test_trace_locations_marks_kept_and_empty() -> None:

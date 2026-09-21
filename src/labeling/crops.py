@@ -13,13 +13,15 @@ import pandas as pd
 from src.config import cfg_get
 from src.io.tile_loader import (
     DEFAULT_FILENAME_PATTERN,
+    TILE_SUFFIXES,
     Tile,
     load_tile_image,
     matching_tile_paths,
-    parse_tile_filename,
     peek_tile_hw,
     resolve_input_dir,
+    try_parse_tile_filename,
 )
+from src.measurement.measurer import DISPLAY_DIRECTION_ORDER, DIRECTION_STEMS, is_direction_tile
 from src.report.report_generator import _to_display_rgb
 from src.stitching.stitcher import LazyMosaic, TilePlacement, placement_from_tile
 
@@ -151,10 +153,24 @@ def find_tile_path(
             if placement.name == name and Path(placement.path).is_file():
                 return Path(placement.path)
     for folder in _candidate_folders(input_dir):
-        candidate = folder / name
+        found = _existing_tile(folder / name)
+        if found is not None:
+            return found
+    raise FileNotFoundError(f"Tile {name!r} was not found in R3 04-08 or the tile folder.")
+
+
+def _existing_tile(path: Path) -> Path | None:
+    """Return ``path`` if it exists, or the same stem with another image suffix."""
+    if path.is_file():
+        return path
+    seen = {path.suffix.lower()}
+    for suffix in TILE_SUFFIXES:
+        if suffix in seen:
+            continue
+        candidate = path.with_suffix(suffix)
         if candidate.is_file():
             return candidate
-    raise FileNotFoundError(f"Tile {name!r} was not found in R3 04-08 or the tile folder.")
+    return None
 
 
 def placement_for_tile(
@@ -231,6 +247,57 @@ def crop_particle(
     )
 
 
+def list_direction_images(folder: str | Path) -> dict[str, Path]:
+    """N/S/E/W image files in ``folder`` (partial sets are allowed)."""
+    directory = Path(folder)
+    found: dict[str, Path] = {}
+    if not directory.is_dir():
+        return found
+    for path in directory.iterdir():
+        if not path.is_file():
+            continue
+        stem = path.stem.upper()
+        if stem not in DIRECTION_STEMS or path.suffix.lower() not in TILE_SUFFIXES:
+            continue
+        found[stem] = path
+    return found
+
+
+def crop_direction_views(
+    row: pd.Series | dict[str, Any],
+    config: dict[str, Any],
+    mosaic: LazyMosaic | None = None,
+    cache: TileImageCache | None = None,
+    origin_cache: dict[str, tuple[int, int]] | None = None,
+) -> dict[str, ParticleCrop]:
+    """Crops of the same location on N, W, E, and S when those tiles exist."""
+    record = dict(row) if not isinstance(row, dict) else dict(row)
+    tile_name = str(record.get("source_tile", "") or "")
+    if not is_direction_tile(tile_name):
+        return {}
+    input_dir = cfg_get(config, "input_dir", None)
+    tile_path = find_tile_path(tile_name, input_dir=input_dir, mosaic=mosaic)
+    siblings = list_direction_images(tile_path.parent)
+    if len(siblings) < 2:
+        return {}
+    views: dict[str, ParticleCrop] = {}
+    loader = cache if cache is not None else TileImageCache()
+    for direction in DISPLAY_DIRECTION_ORDER:
+        path = siblings.get(direction)
+        if path is None:
+            continue
+        sibling = dict(record)
+        sibling["source_tile"] = path.name
+        views[direction] = crop_particle(
+            sibling,
+            config,
+            mosaic=mosaic,
+            cache=loader,
+            origin_cache=origin_cache,
+        )
+    return views
+
+
 def _candidate_folders(input_dir: str | Path | None) -> list[Path]:
     folders: list[Path] = []
     for raw in (input_dir, DEFAULT_WAFER_FOLDER):
@@ -249,7 +316,9 @@ def _grid_index_origin(paths: list[Path], pattern: str) -> tuple[int, int]:
     rows: list[int] = []
     cols: list[int] = []
     for path in paths:
-        meta = parse_tile_filename(path.name, pattern)
+        meta = try_parse_tile_filename(path.name, pattern)
+        if meta is None:
+            continue
         if "row" in meta:
             rows.append(int(meta["row"]))
         if "col" in meta:
@@ -264,7 +333,7 @@ def _placement_from_path(
     row_origin: int,
     col_origin: int,
 ) -> TilePlacement:
-    meta = parse_tile_filename(path.name, pattern)
+    meta = try_parse_tile_filename(path.name, pattern) or {}
     height, width = peek_tile_hw(path)
     tile = Tile(
         path=path,
@@ -279,4 +348,15 @@ def _placement_from_path(
         height=height,
         width=width,
     )
-    return placement_from_tile(tile, overlap, row_origin, col_origin)
+    if tile.x_origin is not None and tile.y_origin is not None:
+        return placement_from_tile(tile, overlap, row_origin, col_origin)
+    if tile.row is not None and tile.col is not None:
+        return placement_from_tile(tile, overlap, row_origin, col_origin)
+    return TilePlacement(
+        path=path,
+        name=path.name,
+        y0=0,
+        x0=0,
+        height=height,
+        width=width,
+    )

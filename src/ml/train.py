@@ -20,6 +20,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import ExtraTreesClassifier
+from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import precision_score, recall_score
 from sklearn.model_selection import GroupKFold, StratifiedKFold, cross_val_predict
 
@@ -28,7 +29,13 @@ from src.io.tile_loader import DEFAULT_FILENAME_PATTERN
 from src.labeling.queue import detection_key
 from src.ml.cnn import train_tiny_cnn
 from src.ml.features import FEATURE_COLUMNS, dataframe_feature_matrix
-from src.ml.infer import KIND_CASCADE, KIND_PATCH, KIND_RESIDUAL, resolve_model_path
+from src.ml.infer import (
+    KIND_CASCADE,
+    KIND_PATCH,
+    KIND_RESIDUAL,
+    load_artifact,
+    next_versioned_model_path,
+)
 from src.ml.patch_features import (
     PATCH_FEATURE_NAMES,
     layout_from_record,
@@ -59,6 +66,55 @@ def default_detection_paths() -> list[Path]:
     if fallback.is_file():
         return [fallback]
     return []
+
+
+def apply_label_filters(
+    labels: pd.DataFrame,
+    *,
+    manifest: Path | None,
+    min_size_nm: float,
+) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    keep = labels.copy()
+    keep["key"] = keep["key"].astype(str)
+    table = None
+    if manifest is not None:
+        table = pd.read_csv(manifest)
+        table["key"] = table["key"].astype(str)
+        keys = set(table["key"])
+        keep = keep.loc[keep["key"].isin(keys)].copy()
+    jpeg = keep["source_tile"].astype(str).str.lower().str.endswith((".jpg", ".jpeg"))
+    keep = keep.loc[~jpeg].copy()
+    if min_size_nm > 0 and "size" in keep.columns:
+        keep = keep.loc[keep["size"].astype(float) >= float(min_size_nm)].copy()
+    keep = keep.loc[keep["label"].astype(str).isin((POSITIVE, NEGATIVE))].copy()
+    return keep, table
+
+
+def overlay_detection_features(labels: pd.DataFrame, detections: Path) -> pd.DataFrame:
+    """Copy residual feature columns from a particles.csv onto labeled keys."""
+    table = pd.read_csv(detections)
+    table["key"] = [detection_key(row) for _, row in table.iterrows()]
+    skip = {"label", "crop_path", "labeled_at", "source_csv", "particle_id"}
+    cols = [name for name in table.columns if name not in skip]
+    extra = table[cols].drop_duplicates(subset=["key"], keep="last")
+    merged = labels.merge(extra, on="key", how="left", suffixes=("", "_det"))
+    for name in extra.columns:
+        if name == "key":
+            continue
+        det_name = f"{name}_det"
+        if det_name in merged.columns:
+            merged[name] = merged[name].where(merged[name].notna(), merged[det_name])
+            merged = merged.drop(columns=[det_name])
+    return merged
+
+
+def v4_scores_for_layouts(layouts: np.ndarray, v4_path: Path) -> np.ndarray:
+    from src.ml.infer import _positive_proba
+
+    artifact = load_artifact(v4_path)
+    width = len(FEATURE_COLUMNS)
+    matrix = np.asarray(layouts, dtype=np.float64)[:, :width]
+    return _positive_proba(artifact["model"], matrix)
 
 
 def load_labeled_features(
@@ -134,6 +190,43 @@ def choose_threshold(
             "recall": float(recall_score(y_true, pred, zero_division=0)),
         }
     return best_t, {"precision": best_prec, "recall": best_rec}
+
+
+def keep_all_threshold(y_true: np.ndarray, proba: np.ndarray) -> float:
+    """Highest threshold that still keeps every positive (min positive score)."""
+    pos = np.asarray(proba, dtype=np.float64)[np.asarray(y_true) == 1]
+    if pos.size == 0:
+        return 0.0
+    return float(np.min(pos))
+
+
+def fit_isotonic_calibrator(raw: np.ndarray, y: np.ndarray) -> IsotonicRegression | None:
+    scores = np.asarray(raw, dtype=np.float64)
+    labels = np.asarray(y)
+    if scores.size < 4 or np.unique(scores).size < 2:
+        return None
+    calibrator = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
+    try:
+        calibrator.fit(scores, labels)
+    except ValueError:
+        return None
+    return calibrator
+
+
+def hard_negative_weights(
+    y: np.ndarray,
+    v4_scores: np.ndarray | None,
+    cutoff: float = 0.20,
+    heavy: float = 3.0,
+) -> np.ndarray:
+    """Up-weight not-particle rows that v4 still keeps at ``cutoff``."""
+    weights = np.ones(len(y), dtype=np.float64)
+    if v4_scores is None or heavy <= 1.0:
+        return weights
+    scores = np.asarray(v4_scores, dtype=np.float64)
+    hard = (np.asarray(y) == 0) & (scores >= float(cutoff))
+    weights[hard] = float(heavy)
+    return weights
 
 
 def _trees() -> ExtraTreesClassifier:
@@ -251,29 +344,73 @@ def train_patch_classifier(
     y: np.ndarray,
     groups: np.ndarray,
     layouts: np.ndarray | None = None,
+    *,
+    sample_weight: np.ndarray | None = None,
+    holdout_mask: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """HOG/LBP ExtraTrees on unmarked crops. GroupKFold by tile."""
     n_pos, n_neg = _require_classes(y)
     x = patches_to_matrix(channels, layouts)
+    y = np.asarray(y)
+    groups = np.asarray(groups)
+    if holdout_mask is None:
+        train_mask = np.ones(len(y), dtype=bool)
+        hold_mask = np.zeros(len(y), dtype=bool)
+    else:
+        hold_mask = np.asarray(holdout_mask, dtype=bool)
+        train_mask = ~hold_mask
+        if int(y[train_mask].sum()) < 2 or int((1 - y[train_mask]).sum()) < 2:
+            train_mask = np.ones(len(y), dtype=bool)
+            hold_mask = np.zeros(len(y), dtype=bool)
     model = _trees()
-    proba = _oof_proba(model, x, y, groups)
-    threshold, metrics = choose_threshold(y, proba)
-    model.fit(x, y)
+    x_train, y_train, g_train = x[train_mask], y[train_mask], groups[train_mask]
+    oof_raw = np.zeros(len(y), dtype=np.float64)
+    oof_raw[train_mask] = _oof_proba(model, x_train, y_train, g_train)
+    weights = None if sample_weight is None else np.asarray(sample_weight)[train_mask]
+    model.fit(x_train, y_train, sample_weight=weights)
+    if hold_mask.any():
+        oof_raw[hold_mask] = _positive_proba_matrix(model, x[hold_mask])
+    calibrator = fit_isotonic_calibrator(oof_raw[train_mask], y_train)
+    calibrated = np.asarray(oof_raw, dtype=np.float64)
+    if calibrator is not None:
+        calibrated = np.asarray(calibrator.predict(oof_raw), dtype=np.float64)
+    thresh_src_y = y[hold_mask] if hold_mask.any() else y
+    thresh_src_p = calibrated[hold_mask] if hold_mask.any() else calibrated
+    if int(thresh_src_y.sum()) < 1:
+        thresh_src_y, thresh_src_p = y, calibrated
+    keep_all = keep_all_threshold(thresh_src_y, thresh_src_p)
+    precision_t, metrics = choose_threshold(thresh_src_y, thresh_src_p)
+    threshold = keep_all if hold_mask.any() else precision_t
     return {
         "kind": KIND_PATCH,
         "model": model,
         "cnn": None,
+        "calibrator": calibrator,
         "feature_names": PATCH_FEATURE_NAMES,
         "patch_size": PATCH_SIZE,
-        "threshold": threshold,
+        "threshold": float(threshold),
+        "threshold_keep_all": float(keep_all),
+        "threshold_precision": float(precision_t),
         "metrics": metrics,
         "hog_metrics": metrics,
         "n_samples": int(len(y)),
         "n_positive": n_pos,
         "n_negative": n_neg,
+        "n_train": int(train_mask.sum()),
+        "n_holdout": int(hold_mask.sum()),
         "feature_importances": _hog_importances(model),
-        "oof_proba": proba,
+        "oof_proba": calibrated,
     }
+
+
+def _positive_proba_matrix(model: ExtraTreesClassifier, matrix: np.ndarray) -> np.ndarray:
+    if matrix.shape[0] == 0:
+        return np.empty((0,), dtype=np.float64)
+    proba = model.predict_proba(matrix)
+    classes = list(model.classes_)
+    if 1 in classes:
+        return np.asarray(proba[:, classes.index(1)], dtype=np.float64)
+    return np.zeros(len(matrix), dtype=np.float64)
 
 
 def _cnn_oof(
@@ -471,11 +608,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=resolve_model_path("models/particle_clf.joblib"),
+        default=None,
+        help="Defaults to the next unused models/particle_clf_vN.joblib.",
     )
     parser.add_argument("--cnn-epochs", type=int, default=8)
     parser.add_argument("--band-low", type=float, default=DEFAULT_BAND_LOW)
     parser.add_argument("--band-high", type=float, default=DEFAULT_BAND_HIGH)
+    parser.add_argument("--manifest", type=Path, default=None)
+    parser.add_argument("--min-size-nm", type=float, default=0.0)
+    parser.add_argument("--input-dir", type=str, default=None)
+    parser.add_argument("--filename-pattern", type=str, default=None)
+    parser.add_argument("--v4-model", type=Path, default=None)
+    parser.add_argument("--hard-neg-weight", type=float, default=3.0)
+    parser.add_argument("--hard-neg-cutoff", type=float, default=0.20)
     return parser.parse_args(argv)
 
 
@@ -487,6 +632,20 @@ def _print_artifact(artifact: dict[str, Any], saved: Path) -> None:
         f"(particle {artifact['n_positive']} / not {artifact['n_negative']})  "
         f"threshold={artifact['threshold']:.2f}  "
         f"OOF precision={metrics['precision']:.3f} recall={metrics['recall']:.3f}",
+        flush=True,
+    )
+    keep_all = artifact.get("threshold_keep_all")
+    precision_t = artifact.get("threshold_precision")
+    if keep_all is not None or precision_t is not None:
+        print(
+            f"  keep_all={float(keep_all or 0):.3f}  "
+            f"precision={float(precision_t or 0):.3f}  "
+            f"train={artifact.get('n_train', artifact['n_samples'])}  "
+            f"holdout={artifact.get('n_holdout', 0)}",
+            flush=True,
+        )
+    print(
+        f"Point ml.model_path at {saved.name} in config.yaml to run this version.",
         flush=True,
     )
     if kind == KIND_CASCADE:
@@ -512,6 +671,8 @@ def _print_artifact(artifact: dict[str, Any], saved: Path) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.output is None:
+        args.output = next_versioned_model_path()
     if args.mode == KIND_RESIDUAL:
         detections = list(args.detections) if args.detections else default_detection_paths()
         if not detections:
@@ -534,7 +695,19 @@ def main(argv: list[str] | None = None) -> int:
     labels = pd.read_csv(args.labels)
     if labels.empty:
         raise SystemExit(f"No labels in {args.labels}")
+    labels, manifest = apply_label_filters(
+        labels, manifest=args.manifest, min_size_nm=float(args.min_size_nm)
+    )
+    if labels.empty:
+        raise SystemExit("No labeled rows left after --manifest / --min-size-nm filters.")
+    detections = list(args.detections) if args.detections else []
+    if detections:
+        labels = overlay_detection_features(labels, detections[0])
     config = default_train_config(args.config)
+    if args.input_dir:
+        config["input_dir"] = args.input_dir
+    if args.filename_pattern:
+        config["filename_pattern"] = args.filename_pattern
     print(f"Loading unmarked patches from {args.labels} (circled JPEGs ignored)", flush=True)
     channels, y, groups, meta = collect_unmarked_dataset(labels, config)
     layouts = _layouts_for_meta(meta, labels, config)
@@ -544,9 +717,39 @@ def main(argv: list[str] | None = None) -> int:
         f"from {pd.unique(groups).size} tiles.",
         flush=True,
     )
+    sample_weight = None
+    if args.v4_model is not None:
+        v4_scores = v4_scores_for_layouts(layouts, args.v4_model)
+        sample_weight = hard_negative_weights(
+            y, v4_scores, cutoff=float(args.hard_neg_cutoff), heavy=float(args.hard_neg_weight)
+        )
+        print(
+            f"Hard-negative weight {args.hard_neg_weight:g} on "
+            f"{int(((y == 0) & (v4_scores >= args.hard_neg_cutoff)).sum())} "
+            f"v4≥{args.hard_neg_cutoff} FPs.",
+            flush=True,
+        )
+    holdout_mask = None
+    if manifest is not None and "split" in manifest.columns:
+        hold_keys = set(
+            manifest.loc[manifest["split"].astype(str) == "holdout_tile", "key"].astype(str)
+        )
+        holdout_mask = meta["key"].astype(str).isin(hold_keys).to_numpy()
+        print(
+            f"Holdout tiles: {int(holdout_mask.sum())} rows / "
+            f"{pd.unique(groups[holdout_mask]).size if holdout_mask.any() else 0} tiles.",
+            flush=True,
+        )
     if args.mode == KIND_PATCH:
         print("Training HOG/LBP ExtraTrees…", flush=True)
-        artifact = train_patch_classifier(channels, y, groups, layouts)
+        artifact = train_patch_classifier(
+            channels,
+            y,
+            groups,
+            layouts,
+            sample_weight=sample_weight,
+            holdout_mask=holdout_mask,
+        )
     else:
         print("Training cascade: HOG ExtraTrees, then CNN on the uncertain band…", flush=True)
         artifact = train_cascade_classifier(

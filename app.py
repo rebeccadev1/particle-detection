@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.config import load_config, resolve_output_dir  # noqa: E402
+from src.config import apply_nsew_settings, load_config, resolve_output_dir  # noqa: E402
 from src.io.results_writer import excel_bytes, write_csv, write_xlsx  # noqa: E402
 from src.labeling.ui import (  # noqa: E402
     render_collection_tab,
@@ -23,6 +23,7 @@ from src.labeling.ui import (  # noqa: E402
     render_tile_inspect_tab,
 )
 from src.labeling.queue import write_last_pipeline  # noqa: E402
+from src.nsew import render_nsew_tab  # noqa: E402
 from src.pipeline.runner import run_pipeline  # noqa: E402
 from src.report.report_generator import (  # noqa: E402
     encode_overlay_jpeg,
@@ -35,7 +36,7 @@ st.set_page_config(page_title="Particle detection", layout="wide")
 st.title("Particle detection on structured surfaces")
 
 NM_PER_UM = 1000.0
-UI_SCHEMA = "mixed_layout_v13"
+UI_SCHEMA = "mixed_layout_v17"
 
 
 def _nm_to_um(nm: float) -> float:
@@ -70,8 +71,6 @@ def _widget_defaults(base: dict) -> dict:
         "ui_input_dir": str(base.get("input_dir") or ""),
         "ui_output_dir": str(base.get("output_dir") or "../Outputs"),
         "ui_filename_pattern": str(base.get("filename_pattern")),
-        "ui_run": str(base.get("run") or ""),
-        "ui_magnification": str(base.get("magnification") or ""),
         "ui_overlap_fraction": float(base.get("overlap_fraction", 0.0)),
         "ui_pixel_size_um": _nm_to_um(float(base.get("pixel_size_nm", 960.0))),
         "ui_workers": int(pipe.get("workers", 0) or 0),
@@ -90,15 +89,14 @@ def _widget_defaults(base: dict) -> dict:
         "ui_blob_threshold": float(det.get("blob_threshold", 0.08)),
         "ui_blob_min_sigma": float(det.get("blob_min_sigma", 3.7)),
         "ui_min_prominence": float(det.get("min_prominence", 0.30)),
-        "ui_min_confidence_pct": int(round(float(det.get("min_confidence", 0.95)) * 100.0)),
+        "ui_min_confidence_pct": int(round(float(det.get("min_confidence", 0.50)) * 100.0)),
         "ui_blob_max_sigma": float(det.get("blob_max_sigma", 36.0)),
         "ui_local_snr_sigma": float(det.get("local_snr_sigma", 0.0)),
         "ui_edge_soften_sigma": float(det.get("edge_soften_sigma", 12.0)),
         "ui_edge_soften_strength": float(det.get("edge_soften_strength", 2.0)),
-        "ui_edge_exclude_px": float(det.get("edge_exclude_px", 48.0)),
-        "ui_min_circularity": float(det.get("min_circularity", 0.30)),
+        "ui_edge_exclude_px": float(det.get("edge_exclude_px", 12.0)),
+        "ui_min_circularity": float(det.get("min_circularity", 0.0)),
         "ui_structure_neighbor_px": float(det.get("structure_neighbor_px", 48.0)),
-        "ui_recall_mode": bool(det.get("recall_mode", False)),
         "ui_ml_enabled": bool((base.get("ml") or {}).get("enabled", False)),
         "ui_ml_threshold": float((base.get("ml") or {}).get("threshold", 0.25)),
         "ui_merge_radius_px": float(meas.get("merge_radius_px", 8.0)),
@@ -112,6 +110,22 @@ def _apply_widget_defaults(base: dict) -> None:
     st.session_state.update(_widget_defaults(base))
 
 
+def _nsew_config(base: dict) -> dict:
+    return apply_nsew_settings(base)
+
+
+def _on_reset_standard(base: dict) -> None:
+    st.session_state["ui_apply_nsew_settings"] = False
+    _apply_widget_defaults(base)
+
+
+def _on_toggle_nsew_settings(base: dict) -> None:
+    if st.session_state.get("ui_apply_nsew_settings"):
+        _apply_widget_defaults(_nsew_config(base))
+    else:
+        _apply_widget_defaults(base)
+
+
 def _sidebar(base: dict) -> dict:
     config = deepcopy(base)
     if st.session_state.get("ui_schema") != UI_SCHEMA:
@@ -121,17 +135,25 @@ def _sidebar(base: dict) -> dict:
 
     st.sidebar.button(
         "Reset to standard values",
-        on_click=_apply_widget_defaults,
+        on_click=_on_reset_standard,
         args=(base,),
         help="Restore every sidebar setting from config.yaml.",
         width="stretch",
+    )
+    st.sidebar.checkbox(
+        "Apply NSEW settings",
+        key="ui_apply_nsew_settings",
+        on_change=_on_toggle_nsew_settings,
+        args=(base,),
+        help="Use Groundup / N/S/E/W standard values (pixel size, preprocess, "
+        "detection, and ML threshold) from nsew_config.yaml.",
     )
 
     st.sidebar.header("Data")
     config["input_dir"] = st.sidebar.text_input(
         "Tile folder",
         key="ui_input_dir",
-        help="Folder of TIFF tiles under ASML SE/Inputs, e.g. R3 04-08.",
+        help="Folder of TIFF/BMP tiles under ASML SE/Inputs, e.g. R3 04-08.",
     )
     config["output_dir"] = st.sidebar.text_input(
         "Output folder",
@@ -141,17 +163,8 @@ def _sidebar(base: dict) -> dict:
     config["filename_pattern"] = st.sidebar.text_input(
         "Filename pattern (regex)",
         key="ui_filename_pattern",
-        help="Default: R{run}_{row}_{col}_{mag}X.tif  e.g. R3_5_32_5X.tif",
-    )
-    config["run"] = st.sidebar.text_input(
-        "Run filter (optional)",
-        key="ui_run",
-        help="Leave empty to include every run. Example: 3 for R3_…",
-    )
-    config["magnification"] = st.sidebar.text_input(
-        "Magnification filter (optional)",
-        key="ui_magnification",
-        help="Leave empty to include every mag. Example: 5 for …_5X.tif",
+        help="Default: R{run}_{row}_{col}_{mag}X.tif or .bmp  e.g. R3_5_32_5X.tif. "
+        "Names that do not match still run detection; they are left out of the mosaic.",
     )
     config["overlap_fraction"] = st.sidebar.slider(
         "Tile overlap fraction",
@@ -314,13 +327,6 @@ def _sidebar(base: dict) -> dict:
         key="ui_structure_neighbor_px",
         help="Drop blobs that have 2+ other blobs this close (chains and grids). 0 disables.",
     )
-    det["recall_mode"] = st.sidebar.checkbox(
-        "High-recall proposals (ML cascade)",
-        key="ui_recall_mode",
-        help="Loosen edge, confidence, and circularity so rim debris can be proposed. "
-        "Cluster/grid rejection stays on. FFT/DoG stay on. Leave the ML filter off "
-        "until you have labeled a smaller run and trained a model.",
-    )
 
     st.sidebar.header("ML filter")
     ml = config.setdefault("ml", {})
@@ -344,7 +350,7 @@ def _sidebar(base: dict) -> dict:
     )
     if not ml.get("model_path"):
         ml["model_path"] = (base.get("ml") or {}).get(
-            "model_path", "models/particle_clf.joblib"
+            "model_path", "models/particle_clf_v3.joblib"
         )
 
     st.sidebar.header("Measurement / report")
@@ -412,11 +418,14 @@ def _run_detection(config: dict, progress, status) -> None:
 
 def _render_detection(config: dict) -> None:
     st.markdown(
-        "Point at a folder of TIFF tiles named **`R{run}_{row}_{col}_{mag}X.tif`** "
-        "(for example `R3_5_32_5X.tif`). Detection runs **per tile**. After that, every "
-        "tile is downsampled and stitched into one overview of about the configured size "
-        "(default **20 MB**). Scale is **1 pixel = 0.96 µm**; size limits are in **µm** "
-        "(default 10–100 µm)."
+        "Point at a folder of TIFF or BMP tiles. Names like **`R{run}_{row}_{col}_{mag}X.tif`** "
+        "(for example `R3_5_32_5X.tif` or `R3_5_32_5X.bmp`) are placed on the grid and stitched. Files that "
+        "do not match still run **per-tile** detection; they are omitted from the mosaic. "
+        "Images named **N, S, E, W** are the same view under different lighting: a hit at "
+        "the same place in more than one of them is **one particle** (size may differ). "
+        "Matching tiles are downsampled and stitched into one overview of about the "
+        "configured size (default **20 MB**). Scale is **1 pixel = 0.96 µm**; size "
+        "limits are in **µm** (default 10–100 µm)."
     )
 
     run = st.button("Run pipeline", type="primary")
@@ -487,8 +496,27 @@ def _render_detection(config: dict) -> None:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-    if mosaic is None:
+    if mosaic is None or not mosaic.placements:
+        if table is not None:
+            st.info(
+                "No tiles had row/column (or x/y) in the filename, so nothing was "
+                "stitched. Detection results are in the table above. Open the Tiles "
+                "tab to inspect each image."
+            )
         return
+
+    placed_names = {placement.name for placement in mosaic.placements}
+    if "source_tile" in table.columns:
+        table_tiles = {
+            str(name).replace("\\", "/").rsplit("/", 1)[-1]
+            for name in table["source_tile"].astype(str)
+        }
+        leftover = table_tiles - placed_names
+        if leftover:
+            st.caption(
+                f"{len(leftover)} file(s) did not match the filename pattern and were "
+                "detected but not stitched into this mosaic."
+            )
 
     st.subheader("Stitched mosaic")
     max_h = max(int(mosaic.full_height), 1)
@@ -561,14 +589,18 @@ def _render_detection(config: dict) -> None:
 
 config = _sidebar(_base_config())
 
-detect_tab, tiles_tab, last_run_tab, label_tab, labeled_tab = st.tabs(
-    ["Detection", "Tiles", "Last Run", "Tinder", "Database"],
+detect_tab, nsew_tab, tiles_tab, last_run_tab, label_tab, labeled_tab = st.tabs(
+    ["Detection", "NSEW", "Tiles", "Last Run", "Tinder", "Database"],
     on_change="rerun",
     key="main_tabs",
 )
 
 with detect_tab:
     _render_detection(config)
+
+if nsew_tab.open:
+    with nsew_tab:
+        render_nsew_tab()
 
 if tiles_tab.open:
     with tiles_tab:

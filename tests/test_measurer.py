@@ -74,6 +74,21 @@ def test_matching_skips_column_zero(tmp_path: Path) -> None:
     assert names == ["R3_2_1_5X.tif"]
 
 
+def test_matching_can_include_unmatched_names(tmp_path: Path) -> None:
+    from src.io.tile_loader import matching_tile_paths
+
+    pattern = r"R(?P<run>\d+)_(?P<row>\d+)_(?P<col>\d+)_(?P<mag>[\d.]+)X\.tiff?"
+    write_tile_tiff(tmp_path / "R3_2_1_5X.tif", np.zeros((8, 8)))
+    write_tile_tiff(tmp_path / "loose_photo.tif", np.zeros((8, 8)))
+    skipped = [p.name for p in matching_tile_paths(tmp_path, pattern)]
+    included = [
+        p.name
+        for p in matching_tile_paths(tmp_path, pattern, include_unmatched=True)
+    ]
+    assert skipped == ["R3_2_1_5X.tif"]
+    assert included == ["R3_2_1_5X.tif", "loose_photo.tif"]
+
+
 def test_local_to_global_and_grid_origin() -> None:
     tile = Tile(
         path=Path("R3_1_2_5X.tif"),
@@ -133,6 +148,136 @@ def test_deduplicate_merges_nearby_candidates() -> None:
     assert merged[0].source_tile == "t0"
     assert merged[0].id == 1
     assert merged[0].circularity == 0.8
+    assert merged[0].nsew_count == 0
+    assert merged[0].nsew_dirs == ""
+
+
+def test_nsew_hits_at_same_place_are_one_particle() -> None:
+    """Same location in N/S/E/W is one particle even when sizes differ."""
+    north = Particle(
+        id=0,
+        x_global=100.0,
+        y_global=200.0,
+        size=12.0,
+        confidence=0.9,
+        source_tile="N.bmp",
+    )
+    south = Particle(
+        id=0,
+        x_global=112.0,
+        y_global=203.0,
+        size=40.0,
+        confidence=0.5,
+        source_tile="S.bmp",
+    )
+    east = Particle(
+        id=0,
+        x_global=108.0,
+        y_global=198.0,
+        size=22.0,
+        confidence=0.7,
+        source_tile="E.png",
+    )
+    west = Particle(
+        id=0,
+        x_global=400.0,
+        y_global=200.0,
+        size=18.0,
+        confidence=0.8,
+        source_tile="W.bmp",
+    )
+    merged = deduplicate(
+        [north, south, east, west],
+        merge_radius=6.0,
+        size_aggregation="max",
+        size_match_fraction=0.4,
+    )
+    assert len(merged) == 2
+    same = next(p for p in merged if p.source_tile == "N.bmp")
+    other = next(p for p in merged if p.source_tile == "W.bmp")
+    assert same.size == 40.0
+    assert same.nsew_count == 3
+    assert same.nsew_dirs == "N,S,E"
+    assert other.nsew_count == 1
+    assert other.nsew_dirs == "W"
+
+
+def test_nsew_does_not_merge_two_hits_on_the_same_tile() -> None:
+    first = Particle(
+        id=0, x_global=100.0, y_global=200.0, size=12.0, confidence=0.9, source_tile="N.bmp"
+    )
+    second = Particle(
+        id=0, x_global=108.0, y_global=200.0, size=11.0, confidence=0.8, source_tile="N.bmp"
+    )
+    west = Particle(
+        id=0, x_global=104.0, y_global=201.0, size=13.0, confidence=0.7, source_tile="W.bmp"
+    )
+    from src.measurement.measurer import deduplicate_nsew
+
+    merged = deduplicate_nsew(
+        [first, second, west],
+        merge_radius=20.0,
+        size_aggregation="max",
+        size_match_fraction=0.4,
+    )
+    north = [p for p in merged if p.source_tile == "N.bmp"]
+    assert len(north) == 2
+    assert any(p.nsew_dirs == "N,W" for p in north)
+    assert any(p.nsew_count == 1 and p.source_tile == "N.bmp" for p in north)
+
+
+def test_combine_tables_merges_directional_unplaced_tiles() -> None:
+    from src.pipeline.runner import _combine_particle_tables
+
+    north = Particle(id=0, x_global=10.0, y_global=12.0, size=8.0, confidence=0.9, source_tile="N.tif")
+    south = Particle(id=0, x_global=11.0, y_global=12.0, size=30.0, confidence=0.4, source_tile="S.tif")
+    loose = Particle(id=0, x_global=10.0, y_global=12.0, size=9.0, confidence=0.8, source_tile="loose.tif")
+    table = _combine_particle_tables(
+        [],
+        {"N.tif": [north], "S.tif": [south], "loose.tif": [loose]},
+        detector_test_config(),
+    )
+    dirs = table.loc[table["source_tile"].isin(["N.tif", "S.tif"])]
+    assert len(dirs) == 1
+    assert int(dirs.iloc[0]["nsew_count"]) == 2
+    assert str(dirs.iloc[0]["nsew_dirs"]) == "N,S"
+    assert float(dirs.iloc[0]["size"]) == 30.0
+    assert "loose.tif" in set(table["source_tile"].astype(str))
+    assert len(table) == 2
+
+
+def test_combine_tables_merges_particles_only_versions() -> None:
+    from src.pipeline.runner import _combine_particle_tables
+
+    two = Particle(
+        id=0,
+        x_global=10.0,
+        y_global=12.0,
+        size=8.0,
+        confidence=0.5,
+        source_tile="particles_only_2of4.png",
+    )
+    four = Particle(
+        id=0,
+        x_global=11.0,
+        y_global=12.0,
+        size=30.0,
+        confidence=0.9,
+        source_tile="particles_only_4of4.png",
+    )
+    table = _combine_particle_tables(
+        [],
+        {
+            "particles_only_2of4.png": [two],
+            "particles_only_4of4.png": [four],
+        },
+        detector_test_config(),
+    )
+    assert len(table) == 1
+    assert int(table.iloc[0]["nsew_count"]) == 2
+    dirs = set(str(table.iloc[0]["nsew_dirs"]).split(","))
+    assert dirs == {"PARTICLES_ONLY_2OF4", "PARTICLES_ONLY_4OF4"}
+    assert float(table.iloc[0]["size"]) == 30.0
 
 
 def test_seam_particle_is_not_double_counted() -> None:
@@ -166,6 +311,76 @@ def test_load_rgb_tile_as_uint8_gray(tmp_path: Path) -> None:
     assert gray.shape == (12, 10)
     assert gray.dtype == np.uint8
     assert int(gray.max()) > 0
+
+
+def test_load_bmp_bytes_named_as_tiff(tmp_path: Path) -> None:
+    import cv2
+    from src.io.tile_loader import load_tile_image, peek_tile_hw
+
+    gray = np.arange(12 * 10, dtype=np.uint8).reshape(12, 10)
+    bmp = tmp_path / "scratch.bmp"
+    path = tmp_path / "R3_0_1_5X.tif"
+    assert cv2.imwrite(str(bmp), gray)
+    path.write_bytes(bmp.read_bytes())
+    assert peek_tile_hw(path) == (12, 10)
+    loaded = load_tile_image(path)
+    assert loaded.shape == (12, 10)
+    assert int(loaded.max()) > 0
+
+
+def test_load_jpeg_bytes_named_as_tiff(tmp_path: Path) -> None:
+    import cv2
+    from src.io.tile_loader import load_tile_image, peek_tile_hw
+
+    bgr = np.zeros((16, 14, 3), dtype=np.uint8)
+    bgr[..., 2] = 255
+    path = tmp_path / "R0_1_1.tiff"
+    ok, encoded = cv2.imencode(".jpg", bgr)
+    assert ok
+    path.write_bytes(encoded.tobytes())
+    assert peek_tile_hw(path) == (16, 14)
+    gray = load_tile_image(path)
+    assert gray.ndim == 2
+    assert gray.shape == (16, 14)
+    assert int(gray.max()) > 0
+
+
+def test_load_and_match_bmp_tiles(tmp_path: Path) -> None:
+    import cv2
+    from src.io.tile_loader import (
+        DEFAULT_FILENAME_PATTERN,
+        list_tile_paths,
+        load_tile_image,
+        matching_tile_paths,
+        peek_tile_hw,
+    )
+
+    gray = np.arange(12 * 10, dtype=np.uint8).reshape(12, 10)
+    path = tmp_path / "R3_2_1_5X.bmp"
+    assert cv2.imwrite(str(path), gray)
+    names = [p.name for p in list_tile_paths(tmp_path)]
+    assert names == ["R3_2_1_5X.bmp"]
+    assert matching_tile_paths(tmp_path, DEFAULT_FILENAME_PATTERN) == [path]
+    assert peek_tile_hw(path) == (12, 10)
+    loaded = load_tile_image(path)
+    assert loaded.ndim == 2
+    assert loaded.shape == (12, 10)
+    assert int(loaded.max()) > 0
+
+
+def test_pipeline_runs_on_bmp_tiles(tmp_path: Path) -> None:
+    import cv2
+
+    image = make_structured_tile((64, 64), particles=[(20.0, 22.0, 3.5)])
+    scaled = np.clip(image / image.max() * 255.0, 0, 255).astype(np.uint8)
+    path = tmp_path / "R3_0_1_5X.bmp"
+    assert cv2.imwrite(str(path), scaled)
+    config = detector_test_config()
+    config["input_dir"] = str(tmp_path)
+    config["output_dir"] = str(tmp_path / "out")
+    table, mosaic = run_pipeline(config)
+    assert [p.name for p in mosaic.placements] == ["R3_0_1_5X.bmp"]
+    assert set(table["source_tile"].astype(str)) == {"R3_0_1_5X.bmp"}
 
 
 def test_pipeline_progress_reports_before_first_tile(tmp_path: Path) -> None:
@@ -323,3 +538,52 @@ def test_pipeline_table_includes_feature_columns(tmp_path: Path) -> None:
     loaded = pd.read_csv(written)
     for column in CANDIDATE_FEATURE_FIELDS:
         assert column in loaded.columns
+
+
+def test_pipeline_merges_nsew_images_as_one_particle(tmp_path: Path) -> None:
+    image = make_structured_tile((64, 64), particles=[(20.0, 22.0, 3.5)])
+    write_tile_tiff(tmp_path / "N.tif", image)
+    write_tile_tiff(tmp_path / "S.tif", image)
+    write_tile_tiff(tmp_path / "E.tif", image)
+    write_tile_tiff(tmp_path / "W.tif", image)
+    config = detector_test_config()
+    config["input_dir"] = str(tmp_path)
+    config["output_dir"] = str(tmp_path / "out")
+    table, mosaic = run_pipeline(config)
+    assert mosaic.placements == []
+    assert not table.empty
+    counts = table["nsew_count"].astype(int)
+    assert int(counts.max()) >= 2
+    assert table["nsew_dirs"].astype(str).str.contains("N").any()
+
+
+def test_pipeline_detects_unmatched_names_without_stitching(tmp_path: Path) -> None:
+    image = make_structured_tile((64, 64), particles=[(20.0, 22.0, 3.5)])
+    write_tile_tiff(tmp_path / "random_photo.tif", image)
+    config = detector_test_config()
+    config["input_dir"] = str(tmp_path)
+    config["output_dir"] = str(tmp_path / "out")
+    table, mosaic = run_pipeline(config)
+    assert mosaic.placements == []
+    assert mosaic.full_height == 0
+    assert not table.empty
+    assert set(table["source_tile"].astype(str)) == {"random_photo.tif"}
+
+
+def test_pipeline_stitches_only_patterned_tiles(tmp_path: Path) -> None:
+    from src.report.report_generator import overlay_markers
+
+    patterned = make_structured_tile((64, 64), particles=[(20.0, 22.0, 3.5)])
+    loose = make_structured_tile((64, 64), particles=[(20.0, 22.0, 3.5)])
+    write_tile_tiff(tmp_path / "R3_0_1_5X.tif", patterned)
+    write_tile_tiff(tmp_path / "loose_photo.tif", loose)
+    config = detector_test_config(report={"downsample": 4})
+    config["input_dir"] = str(tmp_path)
+    config["output_dir"] = str(tmp_path / "out")
+    table, mosaic = run_pipeline(config)
+    assert [p.name for p in mosaic.placements] == ["R3_0_1_5X.tif"]
+    assert "loose_photo.tif" in set(table["source_tile"].astype(str))
+    assert "R3_0_1_5X.tif" in set(table["source_tile"].astype(str))
+    overlay = overlay_markers(mosaic, table, config, crop=None)
+    assert overlay.shape[0] > 0
+    assert overlay.shape[1] > 0

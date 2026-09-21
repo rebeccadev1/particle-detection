@@ -143,6 +143,8 @@ def test_hog_extratrees_separates_letters_from_blobs() -> None:
     assert artifact["metrics"]["recall"] >= 0.8
     assert artifact["metrics"]["precision"] > 0.5
     assert artifact["n_positive"] == 12
+    assert "threshold_keep_all" in artifact
+    assert artifact["n_holdout"] == 0
 
 
 def test_cascade_cnn_on_uncertain_band(tmp_path: Path) -> None:

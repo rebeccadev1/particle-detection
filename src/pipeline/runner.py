@@ -23,10 +23,16 @@ from src.io.tile_loader import (
     Tile,
     load_tile_image,
     matching_tile_paths,
-    parse_tile_filename,
     peek_tile_hw,
+    try_parse_tile_filename,
 )
-from src.measurement.measurer import Particle, measure_and_dedupe, measure_candidates
+from src.measurement.measurer import (
+    Particle,
+    is_nsew_family_tile,
+    measure_and_dedupe,
+    measure_candidates,
+    particles_to_dataframe,
+)
 from src.ml.infer import apply_ml_filter
 from src.preprocessing.corrections import apply_corrections
 from src.stitching.stitcher import (
@@ -52,7 +58,7 @@ class _TileWorkResult:
     """Lightweight per-tile output returned from worker processes."""
 
     particles: list[Particle]
-    placement: TilePlacement
+    placement: TilePlacement | None
     name: str
     thumbnail: np.ndarray | None
 
@@ -70,7 +76,7 @@ def _set_worker_state(
 
 
 def _tile_from_path(path: Path, pattern: str) -> Tile:
-    meta = parse_tile_filename(path.name, pattern)
+    meta = try_parse_tile_filename(path.name, pattern) or {}
     image = load_tile_image(path)
     height, width = int(image.shape[0]), int(image.shape[1])
     return Tile(
@@ -88,15 +94,23 @@ def _tile_from_path(path: Path, pattern: str) -> Tile:
     )
 
 
+def _tile_is_placeable(tile: Tile) -> bool:
+    if tile.x_origin is not None and tile.y_origin is not None:
+        return True
+    return tile.row is not None and tile.col is not None
+
+
 def _placement_from_path(
     path: Path,
     pattern: str,
     overlap: float,
     row_origin: int,
     col_origin: int,
-) -> TilePlacement:
+) -> TilePlacement | None:
     """Grid placement from filename + TIFF header (no pixel decode)."""
-    meta = parse_tile_filename(path.name, pattern)
+    meta = try_parse_tile_filename(path.name, pattern)
+    if meta is None:
+        return None
     height, width = peek_tile_hw(path)
     tile = Tile(
         path=path,
@@ -111,6 +125,8 @@ def _placement_from_path(
         height=height,
         width=width,
     )
+    if not _tile_is_placeable(tile):
+        return None
     return placement_from_tile(tile, overlap, row_origin, col_origin)
 
 
@@ -119,7 +135,9 @@ def _grid_index_origin(paths: list[Path], pattern: str) -> tuple[int, int]:
     rows: list[int] = []
     cols: list[int] = []
     for path in paths:
-        meta = parse_tile_filename(path.name, pattern)
+        meta = try_parse_tile_filename(path.name, pattern)
+        if meta is None:
+            continue
         if "row" in meta:
             rows.append(int(meta["row"]))
         if "col" in meta:
@@ -166,7 +184,14 @@ def _process_tile(
 ) -> _TileWorkResult:
     """Load and process one tile. Top-level for ProcessPoolExecutor pickling."""
     tile = _tile_from_path(Path(path_str), pattern)
-    placement = placement_from_tile(tile, overlap, row_origin, col_origin)
+    if _tile_is_placeable(tile):
+        placement = placement_from_tile(tile, overlap, row_origin, col_origin)
+        origin_x = float(placement.x0)
+        origin_y = float(placement.y0)
+    else:
+        placement = None
+        origin_x = 0.0
+        origin_y = 0.0
     corrected = apply_corrections(tile.image, config)
     ml_on = bool(cfg_get(config, "ml.enabled", False))
     score_before_structure = ml_on and bool(
@@ -185,14 +210,14 @@ def _process_tile(
         candidates = apply_structure_filters(candidates, config)
     particles = measure_candidates(
         candidates,
-        origin_x=float(placement.x0),
-        origin_y=float(placement.y0),
+        origin_x=origin_x,
+        origin_y=origin_y,
         pixel_size_nm=pixel_size,
         source_tile=tile.name,
     )
     factor = int(_WORKER_STATE.get("thumbnail_factor") or 0)
     thumbnail = None
-    if factor > 1:
+    if placement is not None and factor > 1:
         thumbnail = downsample_image(
             np.asarray(tile.image, dtype=np.float32), factor
         )
@@ -213,14 +238,50 @@ def _worker_count(config: dict[str, Any], total_tiles: int) -> int:
 
 def _collect_tile_result(
     result: _TileWorkResult,
-    gathered: list[Particle],
+    placed_particles: list[Particle],
+    unplaced_particles: dict[str, list[Particle]],
     placements: list[TilePlacement],
     thumbnails: dict[str, np.ndarray],
 ) -> None:
-    placements.append(result.placement)
-    gathered.extend(result.particles)
-    if result.thumbnail is not None:
-        thumbnails[result.name] = result.thumbnail
+    if result.placement is not None:
+        placements.append(result.placement)
+        placed_particles.extend(result.particles)
+        if result.thumbnail is not None:
+            thumbnails[result.name] = result.thumbnail
+        return
+    unplaced_particles.setdefault(result.name, []).extend(result.particles)
+
+
+def _combine_particle_tables(
+    placed_particles: list[Particle],
+    unplaced_particles: dict[str, list[Particle]],
+    config: dict[str, Any],
+) -> pd.DataFrame:
+    frames = [measure_and_dedupe(placed_particles, config)]
+    directional: list[Particle] = []
+    for name, particles in unplaced_particles.items():
+        if is_nsew_family_tile(name):
+            directional.extend(particles)
+        else:
+            frames.append(measure_and_dedupe(particles, config))
+    if directional:
+        # Same wafer location in N/W/E/S is one particle; reported size may differ.
+        frames.append(
+            measure_and_dedupe(
+                directional,
+                config,
+                size_match_fraction=float(
+                    cfg_get(config, "measurement.nsew_size_match_fraction", 0.4)
+                ),
+                directional=True,
+            )
+        )
+    nonempty = [frame for frame in frames if not frame.empty]
+    if not nonempty:
+        return frames[0] if frames else particles_to_dataframe([])
+    table = pd.concat(nonempty, ignore_index=True)
+    table["id"] = np.arange(1, len(table) + 1)
+    return table
 
 
 def run_pipeline(
@@ -243,11 +304,13 @@ def run_pipeline(
     run_filter = cfg_get(config, "run", None)
     mag_filter = cfg_get(config, "magnification", None)
 
-    paths = matching_tile_paths(folder, pattern, run_filter, mag_filter)
+    paths = matching_tile_paths(
+        folder, pattern, run_filter, mag_filter, include_unmatched=True
+    )
     total = len(paths)
     if total == 0:
         raise FileNotFoundError(
-            f"No TIFF tiles matching {pattern!r} in {folder}"
+            f"No image tiles in {folder}"
             + (
                 f" (run={run_filter}, mag={mag_filter})"
                 if run_filter not in (None, "") or mag_filter not in (None, "")
@@ -261,14 +324,17 @@ def run_pipeline(
     workers = _worker_count(config, total)
     row_origin, col_origin = _grid_index_origin(paths, pattern)
     placements_plan = [
-        _placement_from_path(path, pattern, overlap, row_origin, col_origin)
+        placement
         for path in paths
+        if (placement := _placement_from_path(path, pattern, overlap, row_origin, col_origin))
+        is not None
     ]
-    thumb_factor = _thumbnail_factor(placements_plan, config)
+    thumb_factor = _thumbnail_factor(placements_plan, config) if placements_plan else 0
     fft_mask = _prepare_fft_mask(paths, config)
     _set_worker_state(fft_mask, thumb_factor)
 
-    gathered: list[Particle] = []
+    placed_particles: list[Particle] = []
+    unplaced_particles: dict[str, list[Particle]] = {}
     placements: list[TilePlacement] = []
     thumbnails: dict[str, np.ndarray] = {}
     # Threads, not processes: ProcessPoolExecutor spawned from Streamlit hangs
@@ -282,7 +348,9 @@ def run_pipeline(
             result = _process_tile(
                 str(path), pattern, overlap, pixel_size, config, row_origin, col_origin
             )
-            _collect_tile_result(result, gathered, placements, thumbnails)
+            _collect_tile_result(
+                result, placed_particles, unplaced_particles, placements, thumbnails
+            )
             if progress_cb is not None:
                 progress_cb(index, total, result.name)
     else:
@@ -304,14 +372,17 @@ def run_pipeline(
             }
             for future in as_completed(futures):
                 result = future.result()
-                _collect_tile_result(result, gathered, placements, thumbnails)
+                _collect_tile_result(
+                    result, placed_particles, unplaced_particles, placements, thumbnails
+                )
                 completed += 1
                 if progress_cb is not None:
                     progress_cb(completed, total, result.name)
 
+    n_gathered = len(placed_particles) + sum(len(v) for v in unplaced_particles.values())
     if progress_cb is not None:
-        progress_cb(total, total, f"merging {len(gathered)} detections…")
-    table = measure_and_dedupe(gathered, config)
+        progress_cb(total, total, f"merging {n_gathered} detections…")
+    table = _combine_particle_tables(placed_particles, unplaced_particles, config)
     mosaic = LazyMosaic(
         placements,
         thumbnails=thumbnails or None,

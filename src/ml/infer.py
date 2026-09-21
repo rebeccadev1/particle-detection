@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -18,14 +19,29 @@ KIND_RESIDUAL = "residual"
 KIND_PATCH = "patch"
 KIND_CASCADE = "cascade"
 
+DEFAULT_MODEL_PATH = "models/particle_clf_v3.joblib"
+_VERSIONED_NAME = re.compile(r"^particle_clf_v(\d+)\.joblib$")
+
 _WORKER_MODEL: dict[str, Any] = {"path": None, "artifact": None}
 
 
 def resolve_model_path(path: str | Path | None) -> Path:
-    raw = Path(str(path or "models/particle_clf.joblib"))
+    raw = Path(str(path or DEFAULT_MODEL_PATH))
     if raw.is_absolute():
         return raw
     return (PACKAGE_ROOT / raw).resolve()
+
+
+def next_versioned_model_path(models_dir: str | Path | None = None) -> Path:
+    """Return models/particle_clf_v{N+1}.joblib from existing vN files."""
+    directory = Path(models_dir) if models_dir is not None else PACKAGE_ROOT / "models"
+    highest = 0
+    if directory.is_dir():
+        for path in directory.glob("particle_clf_v*.joblib"):
+            match = _VERSIONED_NAME.fullmatch(path.name)
+            if match:
+                highest = max(highest, int(match.group(1)))
+    return (directory / f"particle_clf_v{highest + 1}.joblib").resolve()
 
 
 def load_artifact(path: str | Path) -> dict[str, Any]:
@@ -70,6 +86,15 @@ def _positive_proba(model: Any, matrix: np.ndarray) -> np.ndarray:
     return np.zeros(len(matrix), dtype=np.float64)
 
 
+def calibrate_scores(artifact: dict[str, Any], scores: np.ndarray) -> np.ndarray:
+    """Map raw ExtraTrees P to isotonic probabilities when a calibrator exists."""
+    raw = np.asarray(scores, dtype=np.float64)
+    calibrator = artifact.get("calibrator")
+    if calibrator is None or raw.size == 0:
+        return raw
+    return np.asarray(calibrator.predict(raw), dtype=np.float64)
+
+
 def predict_proba(
     candidates: list[ParticleCandidate],
     artifact: dict[str, Any],
@@ -78,7 +103,7 @@ def predict_proba(
     if not candidates:
         return np.empty((0,), dtype=np.float64)
     matrix = candidates_to_matrix(candidates, pixel_size_nm)
-    return _positive_proba(artifact["model"], matrix)
+    return calibrate_scores(artifact, _positive_proba(artifact["model"], matrix))
 
 
 def combine_cascade_scores(
@@ -135,7 +160,9 @@ def predict_patch_scores(
         for cand in candidates
     ]
     matrix = patches_to_matrix(channels, layouts)
-    hog_scores = _positive_proba(artifact["model"], matrix)
+    hog_scores = calibrate_scores(
+        artifact, _positive_proba(artifact["model"], matrix)
+    )
     kind = str(artifact.get("kind") or KIND_PATCH)
     if kind != KIND_CASCADE:
         return hog_scores
@@ -173,7 +200,7 @@ def apply_ml_filter(
     """
     if not bool(cfg_get(config, "ml.enabled", False)):
         return candidates
-    path = resolve_model_path(cfg_get(config, "ml.model_path", "models/particle_clf.joblib"))
+    path = resolve_model_path(cfg_get(config, "ml.model_path", DEFAULT_MODEL_PATH))
     if not path.is_file():
         raise FileNotFoundError(
             f"ml.enabled is true but the classifier was not found at {path}. "

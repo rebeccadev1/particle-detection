@@ -1057,7 +1057,7 @@ def _tile_residual_maps(
     max_sigma = float(cfg_get(config, "detection.blob_max_sigma", 8.0))
     edge_sigma = float(cfg_get(config, "detection.edge_soften_sigma", 12.0))
     edge_strength = float(cfg_get(config, "detection.edge_soften_strength", 2.0))
-    exclude_px = float(cfg_get(config, "detection.edge_exclude_px", 48.0))
+    exclude_px = float(cfg_get(config, "detection.edge_exclude_px", 12.0))
     min_length = float(cfg_get(config, "detection.edge_min_length_px", 40.0))
     min_prominence = float(cfg_get(config, "detection.min_prominence", 0.30))
     edge_distance = (
@@ -1143,10 +1143,10 @@ def _gate_blob(
     config = with_recall_profile(config)
     min_d, max_d = _size_bounds_px(config)
     min_area = float(cfg_get(config, "detection.min_area_px", 4))
-    min_circ = float(cfg_get(config, "detection.min_circularity", 0.30))
+    min_circ = float(cfg_get(config, "detection.min_circularity", 0.0))
     min_confidence = float(cfg_get(config, "detection.min_confidence", 0.0))
     min_prominence = float(cfg_get(config, "detection.min_prominence", 0.30))
-    exclude_px = float(cfg_get(config, "detection.edge_exclude_px", 48.0))
+    exclude_px = float(cfg_get(config, "detection.edge_exclude_px", 12.0))
     max_support = float(cfg_get(config, "detection.max_support_area_px", 0.0) or 0.0)
     mass_fraction = float(
         cfg_get(config, "detection.size_mass_fraction", _CIRCULARITY_MASS_FRACTION)
@@ -1312,7 +1312,7 @@ def trace_locations(
         image, config, fft_mask
     )
     height, width = residual.shape
-    exclude_px = float(cfg_get(config, "detection.edge_exclude_px", 48.0))
+    exclude_px = float(cfg_get(config, "detection.edge_exclude_px", 12.0))
     min_prominence = float(cfg_get(config, "detection.min_prominence", 0.30))
     rows: list[dict[str, Any]] = []
     blob_xy = (

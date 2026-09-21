@@ -9,7 +9,8 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
-from src.labeling.queue import detection_key
+from src.labeling.queue import detection_key, nsew_key_aliases
+from src.measurement.measurer import is_nsew_family_tile
 from src.report.report_generator import encode_overlay_jpeg
 
 LABEL_VALUES = ("particle", "not_sure", "not_particle")
@@ -83,6 +84,8 @@ class LabelStore:
         if label not in LABEL_VALUES:
             raise ValueError(f"Unknown label {label!r}")
         key = str(record.get("key") or detection_key(record))
+        if is_nsew_family_tile(str(record.get("source_tile", "") or "")):
+            key = detection_key(record)
         self.unlabel(key)
         dest = self.crops_dir / label / f"{key}.jpg"
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -110,12 +113,13 @@ class LabelStore:
         df = self.load()
         if df.empty:
             return None
-        mask = df["key"].astype(str) == str(key)
+        mask = df["key"].astype(str).isin(nsew_key_aliases(key))
         if not mask.any():
             return None
         dropped = df.loc[mask].iloc[-1].to_dict()
-        crop_path = dropped.get("crop_path")
-        if crop_path:
+        for crop_path in df.loc[mask, "crop_path"].tolist():
+            if crop_path in (None, ""):
+                continue
             path = Path(str(crop_path))
             if path.is_file():
                 path.unlink()
