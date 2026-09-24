@@ -12,6 +12,8 @@ from src.config import cfg_get, resolve_output_dir
 from src.io.tile_loader import DEFAULT_FILENAME_PATTERN, matching_tile_paths
 from src.labeling.crops import (
     TileImageCache,
+    brightest_direction_crop,
+    config_for_hit_placement,
     crop_direction_views,
     crop_particle,
     find_tile_path,
@@ -40,6 +42,8 @@ from src.labeling.inspect import (
     local_xy_on_tile,
     missed_particle_record,
     overlay_view,
+    pointer_direction_tiles,
+    pointer_set_hits,
     preview_click_crop,
     related_scene_tile_names,
     tile_names_for_hits,
@@ -53,6 +57,8 @@ from src.labeling.queue import (
     label_map_with_aliases,
     merge_detection_tables,
     tag_table,
+    nsew_key_aliases,
+    share_exposure_keys,
     unlabeled_queue,
     snap_detection_keys_to_labels,
 )
@@ -73,6 +79,9 @@ NM_PER_UM = 1000.0
 GALLERY_PAGE_SIZE = 24
 LABEL_IMAGE_WIDTH = 420
 GALLERY_IMAGE_WIDTH = 180
+MARK_COLUMNS = 6
+MARK_IMAGE_WIDTH = 180
+MARK_PAGE_SIZE = 48
 LAST_RUN_OVERVIEW_WIDTH = 720
 LAST_RUN_CROP_COLUMNS = 4
 
@@ -121,6 +130,32 @@ def _labels_for_scene(
     return labels_df.loc[tile.isin(scene)].copy()
 
 
+def _share_exposure_hits(frame: pd.DataFrame | None, config: dict[str, Any]) -> pd.DataFrame | None:
+    """Nearby v3 and v4 hits in an exposure pair share one label key."""
+    if frame is None:
+        return None
+    return share_exposure_keys(
+        frame,
+        str(cfg_get(config, "input_dir", "") or ""),
+        _nsew_merge_radius_nm(config),
+        _nsew_size_match_fraction(config),
+    )
+
+
+def _queue_skip_keys(store, scene_labels: pd.DataFrame, config: dict[str, Any]):
+    """Keys already labeled in this scene.
+
+    A resolved scene with no saved labels yet skips nothing. That keeps a new
+    ``v3_2of4.png`` run separate from older ``v3_2of4.bmp`` marks.
+    """
+    if scene_labels is not None and not scene_labels.empty and "key" in scene_labels.columns:
+        return scene_labels["key"]
+    scene = related_scene_tile_names(cfg_get(config, "input_dir", None))
+    if scene:
+        return []
+    return store.labeled_keys()
+
+
 def render_label_tab(
     config: dict[str, Any],
     project_root: str | Path,
@@ -134,8 +169,9 @@ def render_label_tab(
 
     st.subheader("Label detections")
     st.caption(
-        "Right = particle · Down = not sure · Left = not a particle · Up = undo. "
-        "Load last run queues Detection → Run pipeline output "
+        "One at a time: Right = particle · Down = not sure · Left = not a particle · "
+        "Up = undo. All hits: mark each particle, then All done labels the rest "
+        "as not a particle. Load last run queues Detection → Run pipeline output "
         "(the latest output folder), skipping already-labeled keys. "
         "Labeling N, W, E, S, or a particles-only version labels the same location on all of them."
     )
@@ -162,17 +198,28 @@ def render_label_tab(
         last_csv = last_run_csv(project_root, config)
         crop_config = config
         tables = _detection_tables(project_root, table, config)
+    tables = [
+        shared
+        for frame in tables
+        if (shared := _share_exposure_hits(frame, crop_config)) is not None
+    ]
     n_hits = sum(len(frame) for frame in tables)
     radius_nm = _nsew_merge_radius_nm(crop_config)
     size_frac = _nsew_size_match_fraction(crop_config)
     scene_labels = _labels_for_scene(store.load(), crop_config)
+    skip_keys = _queue_skip_keys(store, scene_labels, crop_config)
     queue = unlabeled_queue(
         tables,
-        scene_labels["key"] if scene_labels is not None and not scene_labels.empty else store.labeled_keys(),
+        skip_keys,
         nsew_merge_radius_nm=radius_nm,
         nsew_size_match_fraction=size_frac,
         labels=scene_labels,
     )
+    placed = config_for_hit_placement(crop_config, queue)
+    if float(placed.get("overlap_fraction", 0.0) or 0.0) != float(
+        crop_config.get("overlap_fraction", 0.0) or 0.0
+    ):
+        crop_config = placed
     front = st.session_state.get("label_front_key")
     if front is not None and not queue.empty:
         match = queue["key"].astype(str) == str(front)
@@ -196,33 +243,75 @@ def render_label_tab(
             f"(already-labeled keys are skipped)."
         )
 
+    mode = st.radio(
+        "Mode",
+        ["One at a time", "All hits"],
+        horizontal=True,
+        key="label_review_mode",
+    )
+
+    marked_particles = {
+        str(key) for key in st.session_state.get("all_hits_particle_keys", [])
+    }
+    if mode == "All hits" and marked_particles:
+        labeled_ids = skip_keys
+        queue = _queue_with_marked_particles(
+            tables,
+            labeled_ids,
+            marked_particles,
+            radius_nm,
+            size_frac,
+            scene_labels,
+        )
+
     if queue.empty:
         st.success("Nothing left to label at 10 µm and above.")
         _undo_row(store, counts)
         return
 
+    if mode == "All hits":
+        _render_all_hits(
+            store,
+            queue,
+            crop_config,
+            marked_particles,
+            mosaic=mosaic,
+            cache=cache,
+            origin_cache=origin_cache,
+        )
+        return
+
     current = queue.iloc[0]
     try:
-        views = crop_direction_views(
+        crop = brightest_direction_crop(
             current,
             crop_config,
             mosaic=mosaic,
             cache=cache,
             origin_cache=origin_cache,
         )
-        if views:
-            crop = views.get(
-                Path(str(current["source_tile"])).stem.upper(),
-                next(iter(views.values())),
-            )
-        else:
-            crop = crop_particle(
+        views = {}
+        if crop is None:
+            views = crop_direction_views(
                 current,
                 crop_config,
                 mosaic=mosaic,
                 cache=cache,
                 origin_cache=origin_cache,
             )
+            if views:
+                crop = views.get(
+                    Path(str(current["source_tile"])).stem.upper(),
+                    next(iter(views.values())),
+                )
+            else:
+                crop = crop_particle(
+                    current,
+                    crop_config,
+                    mosaic=mosaic,
+                    cache=cache,
+                    origin_cache=origin_cache,
+                )
     except (FileNotFoundError, ValueError, OSError) as exc:
         st.error(str(exc))
         _undo_row(store, counts)
@@ -245,11 +334,17 @@ def render_label_tab(
         )
     else:
         image_col, _ = st.columns([LABEL_IMAGE_WIDTH, 800])
+        where = f"{crop.direction} · " if crop.direction else ""
+        shared_with = str(current.get("exposure_with") or "")
+        shared_note = ""
+        if shared_with and shared_with.lower() != "nan":
+            shared_note = f" · same particle on {shared_with}"
         image_col.image(
             crop.rgb,
             caption=(
-                f"id {current.get('id', '')} · {current['source_tile']} · "
+                f"{where}id {current.get('id', '')} · {current['source_tile']} · "
                 f"{size_um:.2f} µm · confidence {float(current.get('confidence', 0.0)):.3f}"
+                f"{shared_note}"
             ),
             width=LABEL_IMAGE_WIDTH,
         )
@@ -290,6 +385,199 @@ def render_label_tab(
         if restored is not None:
             st.session_state["label_front_key"] = str(restored["key"])
         st.rerun()
+
+
+def _queue_with_marked_particles(
+    tables: list[pd.DataFrame],
+    labeled_keys,
+    marked_particles: set[str],
+    radius_nm: float,
+    size_frac: float,
+    labels: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """Unlabeled hits, plus particles already pressed in this All hits review."""
+    skip = expand_labeled_keys(str(key) for key in labeled_keys)
+    for key in marked_particles:
+        skip.difference_update(nsew_key_aliases(key))
+    return unlabeled_queue(
+        tables,
+        skip,
+        nsew_merge_radius_nm=radius_nm,
+        nsew_size_match_fraction=size_frac,
+        labels=labels,
+    )
+
+
+def _marked_particle_button_css(keys: set[str]) -> None:
+    rules = []
+    for key in sorted(keys):
+        rules.append(
+            f".st-key-mark_particle_{key} button"
+            "{background-color:#1b7f3a;border-color:#1b7f3a;color:#ffffff;}"
+        )
+    if not rules:
+        return
+    st.markdown("<style>\n" + "\n".join(rules) + "\n</style>", unsafe_allow_html=True)
+
+
+def _tinder_crop(
+    record: dict[str, Any],
+    crop_config: dict[str, Any],
+    *,
+    mosaic: LazyMosaic | None,
+    cache: TileImageCache,
+    origin_cache: dict,
+):
+    """Directional crop when the hit is on a combined image, otherwise the source tile."""
+    bright = brightest_direction_crop(
+        record,
+        crop_config,
+        mosaic=mosaic,
+        cache=cache,
+        origin_cache=origin_cache,
+    )
+    if bright is not None:
+        return bright
+    return crop_particle(
+        record,
+        crop_config,
+        mosaic=mosaic,
+        cache=cache,
+        origin_cache=origin_cache,
+    )
+
+
+def _render_all_hits(
+    store: LabelStore,
+    queue: pd.DataFrame,
+    crop_config: dict[str, Any],
+    marked_particles: set[str],
+    *,
+    mosaic: LazyMosaic | None,
+    cache: TileImageCache,
+    origin_cache: dict,
+) -> None:
+    """Show unlabeled hits in a grid. Particle marks one; All done labels the rest."""
+    pressed = queue["key"].astype(str).isin(marked_particles)
+    open_queue = queue.loc[~pressed]
+    remaining = len(open_queue)
+    done = st.button(
+        "All done",
+        type="primary",
+        key="label_all_done",
+        help=(
+            f"Label all {remaining} hits still in the queue as not a particle, "
+            "including hits on other pages. Hits you already marked stay particles."
+        ),
+    )
+    n_pages = max(1, (len(queue) + MARK_PAGE_SIZE - 1) // MARK_PAGE_SIZE)
+    stored_page = int(st.session_state.get("label_all_hits_page", 1) or 1)
+    if stored_page < 1 or stored_page > n_pages:
+        st.session_state["label_all_hits_page"] = min(max(stored_page, 1), n_pages)
+    page = int(
+        st.number_input(
+            "Page",
+            min_value=1,
+            max_value=n_pages,
+            key="label_all_hits_page",
+        )
+    )
+    st.caption(
+        f"{len(queue)} hits · {int(pressed.sum())} marked particle · "
+        f"page {page} of {n_pages}. "
+        "Press Particle on each real one. A pressed button turns green. "
+        "All done labels every unmarked hit as not a particle, "
+        "including hits on other pages."
+    )
+    _marked_particle_button_css(marked_particles)
+    if done:
+        st.session_state["all_hits_particle_keys"] = []
+        with st.spinner(f"Labeling {remaining} hits as not a particle…"):
+            _label_queue(
+                store,
+                open_queue,
+                "not_particle",
+                crop_config,
+                mosaic,
+                cache,
+                origin_cache,
+            )
+        return
+
+    start = (page - 1) * MARK_PAGE_SIZE
+    page_rows = queue.iloc[start : start + MARK_PAGE_SIZE]
+    columns = st.columns(MARK_COLUMNS)
+    for index, record in enumerate(page_rows.to_dict(orient="records")):
+        key = str(record.get("key") or index)
+        with columns[index % MARK_COLUMNS]:
+            try:
+                crop = _tinder_crop(
+                    record,
+                    crop_config,
+                    mosaic=mosaic,
+                    cache=cache,
+                    origin_cache=origin_cache,
+                )
+            except (FileNotFoundError, ValueError, OSError) as exc:
+                st.error(str(exc))
+                continue
+            size_um = float(record["size"]) / NM_PER_UM
+            where = f"{crop.direction} · " if crop.direction else ""
+            st.image(
+                crop.rgb,
+                caption=(
+                    f"{where}id {record.get('id', '')} · {size_um:.1f} µm · "
+                    f"{float(record.get('confidence', 0.0)):.2f}"
+                ),
+                width=MARK_IMAGE_WIDTH,
+            )
+            already = key in marked_particles
+            if st.button(
+                "Particle",
+                key=f"mark_particle_{key}",
+                type="secondary" if already else "primary",
+                width="stretch",
+            ):
+                store.apply_label(record, "particle", crop.rgb)
+                marked_now = list(st.session_state.get("all_hits_particle_keys") or [])
+                if key not in marked_now:
+                    marked_now.append(key)
+                st.session_state["all_hits_particle_keys"] = marked_now
+                st.session_state.pop("label_front_key", None)
+                st.rerun()
+
+
+def _label_queue(
+    store: LabelStore,
+    queue: pd.DataFrame,
+    label: str,
+    crop_config: dict[str, Any],
+    mosaic: LazyMosaic | None,
+    cache: TileImageCache,
+    origin_cache: dict,
+) -> None:
+    items: list[tuple[dict[str, Any], str, Any]] = []
+    failed: list[str] = []
+    for record in queue.to_dict(orient="records"):
+        try:
+            crop = _tinder_crop(
+                record,
+                crop_config,
+                mosaic=mosaic,
+                cache=cache,
+                origin_cache=origin_cache,
+            )
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            failed.append(str(exc))
+            continue
+        items.append((record, label, crop.rgb))
+    if items:
+        store.apply_labels(items)
+        st.session_state.pop("label_front_key", None)
+    if failed:
+        st.error("Left unlabeled: " + "; ".join(failed[:8]))
+        return
+    st.rerun()
 
 
 def _on_load_last_pipeline() -> None:
@@ -342,6 +630,7 @@ def _last_pipeline_view(
         detections = load_particles_csv(last_csv)
     elif table is not None:
         detections = tag_table(table, last_csv)
+    detections = _share_exposure_hits(detections, run_config)
     return run_config, last_csv, detections
 
 
@@ -358,7 +647,7 @@ def render_tile_inspect_tab(
         "orange = unlabeled detection. Zoom a 3×3 cell, click an unmarked speck, then "
         "Mark missed particle. Left/Right change tile. "
         "Same map as Last Run (not the sidebar Tile folder). "
-        "A label on N, S, E, or W is applied to all four."
+        "A mark on N of a set is shown on S, E, and W of that same set."
     )
 
     try:
@@ -376,22 +665,27 @@ def render_tile_inspect_tab(
     inspect_mosaic = mosaic
     if str(cfg_get(config, "input_dir", "") or "") != folder:
         inspect_mosaic = None
-    try:
-        paths = matching_tile_paths(
-            folder,
-            pattern,
-            run=cfg_get(run_config, "run", None),
-            magnification=cfg_get(run_config, "magnification", None),
-            include_unmatched=True,
-        )
-    except (FileNotFoundError, ValueError) as exc:
-        st.error(str(exc))
-        return
-    if not paths:
-        st.warning(f"No matching tiles in {folder}.")
-        return
-
-    names = [path.name for path in paths]
+    pointer_tiles = pointer_direction_tiles(folder)
+    by_label = {tile.label: tile for tile in pointer_tiles}
+    if pointer_tiles:
+        paths = [tile.path for tile in pointer_tiles]
+        names = [tile.label for tile in pointer_tiles]
+    else:
+        try:
+            paths = matching_tile_paths(
+                folder,
+                pattern,
+                run=cfg_get(run_config, "run", None),
+                magnification=cfg_get(run_config, "magnification", None),
+                include_unmatched=True,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            st.error(str(exc))
+            return
+        if not paths:
+            st.warning(f"No matching tiles in {folder}.")
+            return
+        names = [path.name for path in paths]
     st.session_state["_inspect_tile_names"] = names
     if st.session_state.get("inspect_tile") not in names:
         st.session_state["inspect_tile"] = names[0]
@@ -423,32 +717,40 @@ def render_tile_inspect_tab(
     )
 
     tile_name = str(st.session_state["inspect_tile"])
-    tile_path = next(path for path in paths if path.name == tile_name)
+    pointer = by_label.get(tile_name)
+    if pointer is not None:
+        tile_path = pointer.path
+    else:
+        tile_path = next(path for path in paths if path.name == tile_name)
     index = names.index(tile_name)
     st.caption(f"Tile {index + 1} of {len(names)} · {tile_path}")
 
     store = labels_store(project_root)
     labels_df = store.load()
     scene_labels = _labels_for_scene(labels_df, config, names)
-    label_map = label_map_with_aliases(scene_labels)
 
     if detections is None:
         detections = pd.DataFrame()
     else:
         detections = snap_detection_keys_to_labels(
             detections,
-            scene_labels,
+            labels_df if pointer is not None else scene_labels,
             _nsew_merge_radius_nm(config),
             _nsew_size_match_fraction(config),
         )
-    tile_hits = detections_on_tile(detections, tile_name)
-    extra = _label_rows_missing_from_hits(
-        scene_labels, tile_name, tile_hits, folder_tiles=list(
-            related_scene_tile_names(cfg_get(config, "input_dir", None), names) or names
+    if pointer is not None:
+        tile_hits = pointer_set_hits(detections, labels_df, pointer.set_id)
+        label_map = label_map_with_aliases(labels_df)
+    else:
+        tile_hits = detections_on_tile(detections, tile_name)
+        extra = _label_rows_missing_from_hits(
+            scene_labels, tile_name, tile_hits, folder_tiles=list(
+                related_scene_tile_names(cfg_get(config, "input_dir", None), names) or names
+            )
         )
-    )
-    if extra is not None and not extra.empty:
-        tile_hits = pd.concat([tile_hits, extra], ignore_index=True)
+        if extra is not None and not extra.empty:
+            tile_hits = pd.concat([tile_hits, extra], ignore_index=True)
+        label_map = label_map_with_aliases(scene_labels)
 
     keys = (
         tile_hits["key"].astype(str).tolist()
@@ -832,6 +1134,7 @@ def render_labeled_tiles_tab(
         except (ValueError, OSError) as exc:
             st.error(str(exc))
             return
+    detections = _share_exposure_hits(detections, run_config)
     if detections is None:
         st.info("Run the pipeline on the Detection tab. This tab follows that run.")
         return

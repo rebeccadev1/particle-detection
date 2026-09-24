@@ -60,7 +60,11 @@ def write_xlsx(
     path: str | Path,
     config: Mapping[str, Any] | None = None,
 ) -> Path:
-    """Write particles on sheet 1 and selected run parameters on sheet 2."""
+    """Write particles on sheet 1 and this run's settings on sheet 2.
+
+    Sheet 2 includes preprocessing and detection (and the rest of the config
+    that was passed in, such as pixel size and ML).
+    """
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     _write_workbook(destination, _validate(df), parameters_table(config))
@@ -131,5 +135,8 @@ def _column_width(frame: pd.DataFrame, column: str) -> float:
     if frame.empty:
         return max(header, 12) + 2
     sample = frame[column].astype(str).head(200)
-    body = int(sample.str.len().max()) if len(sample) else 0
+    if sample.empty:
+        return max(header, 12) + 2
+    longest = sample.str.len().max()
+    body = int(longest) if pd.notna(longest) else 0
     return max(header, body, 12) + 2

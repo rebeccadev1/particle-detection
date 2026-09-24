@@ -1,4 +1,4 @@
-"""NSEW standard-values overlay used by the sidebar checkbox."""
+"""NSEW standard-values overlay used by the sidebar NSEW toggle."""
 
 from __future__ import annotations
 
@@ -122,10 +122,11 @@ def test_nsew_config_file_has_sidebar_keys() -> None:
     assert merged["ml"]["threshold"] == overlay["ml"]["threshold"]
 
 
-def test_app_sidebar_has_apply_nsew_settings_checkbox() -> None:
+def test_app_sidebar_has_nsew_toggle() -> None:
     text = (PACKAGE_ROOT / "app.py").read_text(encoding="utf-8")
-    assert "Apply NSEW settings" in text
-    assert "ui_apply_nsew_settings" in text
+    assert ".toggle(" in text
+    assert "Uniform" in text
+    assert "ui_settings_nsew" in text
     assert "apply_nsew_settings" in text
 
 

@@ -36,7 +36,7 @@ st.set_page_config(page_title="Particle detection", layout="wide")
 st.title("Particle detection on structured surfaces")
 
 NM_PER_UM = 1000.0
-UI_SCHEMA = "mixed_layout_v17"
+UI_SCHEMA = "mixed_layout_v19"
 
 
 def _nm_to_um(nm: float) -> float:
@@ -115,12 +115,12 @@ def _nsew_config(base: dict) -> dict:
 
 
 def _on_reset_standard(base: dict) -> None:
-    st.session_state["ui_apply_nsew_settings"] = False
+    st.session_state["ui_settings_nsew"] = False
     _apply_widget_defaults(base)
 
 
-def _on_toggle_nsew_settings(base: dict) -> None:
-    if st.session_state.get("ui_apply_nsew_settings"):
+def _on_settings_profile(base: dict) -> None:
+    if st.session_state.get("ui_settings_nsew"):
         _apply_widget_defaults(_nsew_config(base))
     else:
         _apply_widget_defaults(base)
@@ -129,6 +129,7 @@ def _on_toggle_nsew_settings(base: dict) -> None:
 def _sidebar(base: dict) -> dict:
     config = deepcopy(base)
     if st.session_state.get("ui_schema") != UI_SCHEMA:
+        st.session_state["ui_settings_nsew"] = False
         _apply_widget_defaults(base)
         st.session_state["ui_schema"] = UI_SCHEMA
         st.session_state["ui_initialized"] = True
@@ -140,13 +141,43 @@ def _sidebar(base: dict) -> dict:
         help="Restore every sidebar setting from config.yaml.",
         width="stretch",
     )
-    st.sidebar.checkbox(
-        "Apply NSEW settings",
-        key="ui_apply_nsew_settings",
-        on_change=_on_toggle_nsew_settings,
+    if not isinstance(st.session_state.get("ui_settings_nsew"), bool):
+        st.session_state["ui_settings_nsew"] = False
+    uniform_col, nsew_col = st.sidebar.columns([1, 1.4], vertical_alignment="center")
+    uniform_col.markdown(
+        """
+<style>
+div[data-testid="stHorizontalBlock"]:has(#settings-uniform) [data-testid="stColumn"]:first-child,
+div[data-testid="stHorizontalBlock"]:has(#settings-uniform) [data-testid="stColumn"]:first-child [data-testid="stElementContainer"],
+div[data-testid="stHorizontalBlock"]:has(#settings-uniform) [data-testid="stColumn"]:first-child [data-testid="stMarkdown"],
+div[data-testid="stHorizontalBlock"]:has(#settings-uniform) [data-testid="stColumn"]:first-child [data-testid="stMarkdownContainer"] {
+  margin: 0 !important;
+  padding: 0 !important;
+  height: 24px !important;
+  min-height: 24px !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: flex-end !important;
+}
+#settings-uniform {
+  margin: 0;
+  font-size: 14px;
+  line-height: 21px;
+  font-weight: 400;
+}
+</style>
+<div id="settings-uniform">Uniform</div>
+""",
+        unsafe_allow_html=True,
+    )
+    nsew_col.toggle(
+        "NSEW",
+        key="ui_settings_nsew",
+        on_change=_on_settings_profile,
         args=(base,),
-        help="Use Groundup / N/S/E/W standard values (pixel size, preprocess, "
-        "detection, and ML threshold) from nsew_config.yaml.",
+        help="Off is Uniform (config.yaml, v5 threshold 0.39). "
+        "On loads NSEW pixel size, preprocess, detection, and ML threshold "
+        "from nsew_config.yaml.",
     )
 
     st.sidebar.header("Data")
@@ -344,7 +375,7 @@ def _sidebar(base: dict) -> dict:
         "ML P(particle) threshold",
         min_value=ml_min,
         max_value=ml_max,
-        step=0.05,
+        step=0.01,
         key="ui_ml_threshold",
         help="Keep blobs with at least this probability. 0 keeps every proposal.",
     )
@@ -500,7 +531,7 @@ def _render_detection(config: dict) -> None:
         if table is not None:
             st.info(
                 "No tiles had row/column (or x/y) in the filename, so nothing was "
-                "stitched. Detection results are in the table above. Open the Tiles "
+                "stitched. Detection results are in the table above. Open the Pointer "
                 "tab to inspect each image."
             )
         return
@@ -590,7 +621,7 @@ def _render_detection(config: dict) -> None:
 config = _sidebar(_base_config())
 
 detect_tab, nsew_tab, tiles_tab, last_run_tab, label_tab, labeled_tab = st.tabs(
-    ["Detection", "NSEW", "Tiles", "Last Run", "Tinder", "Database"],
+    ["Detection", "NSEW", "Pointer", "Last Run", "Tinder", "Database"],
     on_change="rerun",
     key="main_tabs",
 )

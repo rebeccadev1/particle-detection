@@ -28,7 +28,9 @@ detection:
   fft_mask: per_tile
   tophat_radius: 50
   # 0.96 µm/px: 10 µm ≈ 10.4 px (DoG sigma ≈ 3.7). Sigma 36 ≈ 100 µm.
-  # Product size floor is 20 µm. Keep blob_min_sigma at 3.7: raising it to 7.4
+  # Product size floor is 20 µm on the photo equivalent diameter only.
+  # DoG sigma is the search scale and does not reject a peak.
+  # Keep blob_min_sigma at 3.7: raising it to 7.4
   # on R4 flooded layout FPs and dropped recall below 95%.
   # Top-hat radius must exceed the largest particle or flakes are erased.
   blob_method: dog
@@ -93,8 +95,8 @@ measurement:
 ml:
   enabled: true
   model_path: models/particle_clf_v5.joblib
-  # v5 keep-all on R4 holdout tiles; bake-off on frozen winner: 39 TP / 77 FP.
-  threshold: 0.0165
+  # v5 on the R4 holdout: 0.39 is P = R = 0.878 (36 real, 5 fake, 5 missed).
+  threshold: 0.39
   # Score gated DoG hits before cluster/line filters, then apply those filters
   # to ML survivors. Off: classical cluster/line first (default). On can add
   # lattice neighbors that cluster-kill isolated flakes. Cluster stays on either way.

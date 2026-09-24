@@ -81,32 +81,53 @@ class LabelStore:
         crop: np.ndarray,
     ) -> Path:
         """Write the crop JPEG and append/replace the CSV row immediately."""
-        if label not in LABEL_VALUES:
-            raise ValueError(f"Unknown label {label!r}")
-        key = str(record.get("key") or detection_key(record))
-        if is_nsew_family_tile(str(record.get("source_tile", "") or "")):
-            key = detection_key(record)
-        self.unlabel(key)
-        dest = self.crops_dir / label / f"{key}.jpg"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(encode_overlay_jpeg(np.asarray(crop)))
-        row = {
-            "key": key,
-            "particle_id": record.get("id", record.get("particle_id", "")),
-            "source_tile": record.get("source_tile", ""),
-            "x_global": record.get("x_global", ""),
-            "y_global": record.get("y_global", ""),
-            "size": record.get("size", ""),
-            "confidence": record.get("confidence", ""),
-            "label": label,
-            "crop_path": str(dest),
-            "source_csv": record.get("source_csv", ""),
-            "labeled_at": _now(),
-        }
+        return self.apply_labels([(record, label, crop)])[0]
+
+    def apply_labels(
+        self,
+        items: list[tuple[Mapping[str, Any], str, np.ndarray]],
+    ) -> list[Path]:
+        """Write many crops and replace their CSV rows in one save."""
+        if not items:
+            return []
+        prepared: dict[str, tuple[Mapping[str, Any], str, np.ndarray]] = {}
+        order: list[str] = []
+        for record, label, crop in items:
+            if label not in LABEL_VALUES:
+                raise ValueError(f"Unknown label {label!r}")
+            key = _label_key(record)
+            if key not in prepared:
+                order.append(key)
+            prepared[key] = (record, label, crop)
+
+        drop_keys: set[str] = set()
+        for key in order:
+            drop_keys.update(nsew_key_aliases(key))
+
         df = self.load()
-        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+        if not df.empty:
+            mask = df["key"].astype(str).isin(drop_keys)
+            for crop_path in df.loc[mask, "crop_path"].tolist():
+                if crop_path in (None, ""):
+                    continue
+                path = Path(str(crop_path))
+                if path.is_file():
+                    path.unlink()
+            df = df.loc[~mask].reset_index(drop=True)
+
+        stamped = _now()
+        rows: list[dict[str, Any]] = []
+        dests: list[Path] = []
+        for key in order:
+            record, label, crop = prepared[key]
+            dest = self.crops_dir / label / f"{key}.jpg"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(encode_overlay_jpeg(np.asarray(crop)))
+            rows.append(_label_row(record, key, label, dest, stamped))
+            dests.append(dest)
+        df = pd.concat([df, pd.DataFrame(rows)], ignore_index=True)
         self._write(df)
-        return dest
+        return dests
 
     def unlabel(self, key: str) -> dict[str, Any] | None:
         """Remove a labeled record and its crop. Returns the dropped row if any."""
@@ -142,6 +163,35 @@ class LabelStore:
             _empty_table().to_csv(self.csv_path, index=False)
             return
         df.loc[:, list(COLUMNS)].to_csv(self.csv_path, index=False)
+
+
+def _label_key(record: Mapping[str, Any]) -> str:
+    key = str(record.get("key") or detection_key(record))
+    if is_nsew_family_tile(str(record.get("source_tile", "") or "")):
+        return detection_key(record)
+    return key
+
+
+def _label_row(
+    record: Mapping[str, Any],
+    key: str,
+    label: str,
+    dest: Path,
+    stamped: str,
+) -> dict[str, Any]:
+    return {
+        "key": key,
+        "particle_id": record.get("id", record.get("particle_id", "")),
+        "source_tile": record.get("source_tile", ""),
+        "x_global": record.get("x_global", ""),
+        "y_global": record.get("y_global", ""),
+        "size": record.get("size", ""),
+        "confidence": record.get("confidence", ""),
+        "label": label,
+        "crop_path": str(dest),
+        "source_csv": record.get("source_csv", ""),
+        "labeled_at": stamped,
+    }
 
 
 def _empty_table() -> pd.DataFrame:

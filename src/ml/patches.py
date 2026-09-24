@@ -6,6 +6,8 @@ Reads the source TIFF and the DoG residual. Never uses circled JPEGs under
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Mapping
@@ -151,6 +153,59 @@ def local_xy_for_record(
     return tile_path, float(x_local), float(y_local)
 
 
+def _limit_blas_threads() -> None:
+    """Keep each worker on one core so a process pool does not oversubscribe."""
+    try:
+        import cv2
+
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
+    try:
+        from threadpoolctl import threadpool_limits
+
+        threadpool_limits(limits=1).__enter__()
+    except Exception:
+        pass
+
+
+def _patches_for_tile(
+    tile_name: str,
+    records: list[dict[str, Any]],
+    config: dict[str, Any],
+    size: int,
+) -> list[UnmarkedPatch]:
+    """Extract every unmarked crop on one tile. Missing tiles return []."""
+    if not records:
+        return []
+    loader = TileResidualCache()
+    origin_cache: dict[str, tuple[int, int]] = {}
+    try:
+        tile_path, _, _ = local_xy_for_record(records[0], config, origin_cache)
+        corrected, residual = loader.maps(tile_path, config)
+    except FileNotFoundError:
+        return []
+    patches: list[UnmarkedPatch] = []
+    for record in records:
+        try:
+            _path, x_local, y_local = local_xy_for_record(record, config, origin_cache)
+        except FileNotFoundError:
+            continue
+        patches.append(
+            UnmarkedPatch(
+                key=str(record.get("key", "")),
+                label=str(record["label"]),
+                source_tile=str(tile_name),
+                x_local=x_local,
+                y_local=y_local,
+                channels=extract_unmarked_channels(
+                    corrected, residual, x_local, y_local, size=size
+                ),
+            )
+        )
+    return patches
+
+
 def iter_unmarked_patches(
     labels: pd.DataFrame,
     config: dict[str, Any],
@@ -199,21 +254,58 @@ def collect_unmarked_dataset(
     labels: pd.DataFrame,
     config: dict[str, Any],
     size: int = PATCH_SIZE,
+    workers: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
-    """Stack patches, labels, tile groups, and a metadata table."""
+    """Stack patches, labels, tile groups, and a metadata table.
+
+    ``workers`` is the process-pool size. ``None`` uses every CPU core.
+    One tile, or ``workers=1``, stays in this process.
+    """
+    keep = labels.loc[labels["label"].astype(str).isin((POSITIVE, NEGATIVE))].copy()
+    grouped = [
+        (str(tile_name), group.to_dict(orient="records"))
+        for tile_name, group in keep.groupby(keep["source_tile"].astype(str), sort=False)
+    ]
+    n_workers = os.cpu_count() or 1 if workers is None else max(1, int(workers))
+    n_workers = min(n_workers, max(1, len(grouped)))
+    found_by_tile: list[list[UnmarkedPatch]] = []
+    if n_workers <= 1:
+        for tile_name, records in grouped:
+            found = _patches_for_tile(tile_name, records, config, size)
+            if found:
+                print(f"  {tile_name}  n={len(found)}", flush=True)
+                found_by_tile.append(found)
+    else:
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            initializer=_limit_blas_threads,
+        ) as pool:
+            futures = {
+                pool.submit(_patches_for_tile, tile_name, records, config, size): index
+                for index, (tile_name, records) in enumerate(grouped)
+            }
+            slots: list[list[UnmarkedPatch] | None] = [None] * len(grouped)
+            for future in as_completed(futures):
+                index = futures[future]
+                found = future.result()
+                slots[index] = found
+                if found:
+                    print(f"  {grouped[index][0]}  n={len(found)}", flush=True)
+            found_by_tile = [slot for slot in slots if slot]
     rows: list[dict[str, Any]] = []
     patches: list[np.ndarray] = []
-    for patch in iter_unmarked_patches(labels, config, size=size):
-        patches.append(patch.channels)
-        rows.append(
-            {
-                "key": patch.key,
-                "label": patch.label,
-                "source_tile": patch.source_tile,
-                "x_local": patch.x_local,
-                "y_local": patch.y_local,
-            }
-        )
+    for tile_patches in found_by_tile:
+        for patch in tile_patches:
+            patches.append(patch.channels)
+            rows.append(
+                {
+                    "key": patch.key,
+                    "label": patch.label,
+                    "source_tile": patch.source_tile,
+                    "x_local": patch.x_local,
+                    "y_local": patch.y_local,
+                }
+            )
     if not patches:
         raise ValueError(
             "No unmarked patches could be extracted. Check that the labeled "

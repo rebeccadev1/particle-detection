@@ -670,3 +670,65 @@ def test_local_px_roundtrip_to_global_nm() -> None:
     x_local, y_local = global_nm_to_local_px(x_global, y_global, placement, pixel_size_nm=2.0)
     assert x_local == 5.0
     assert y_local == 4.0
+
+
+def test_pointer_uses_directional_photos_and_shares_one_set(tmp_path: Path) -> None:
+    import cv2
+
+    from src.labeling.inspect import pointer_direction_tiles, pointer_set_hits
+
+    staged = tmp_path / "Inputs" / "Groundup v4 ML off"
+    staged.mkdir(parents=True)
+    photo = np.zeros((8, 8), dtype=np.uint8)
+    for set_id in ("v1", "v2"):
+        cv2.imwrite(str(staged / f"{set_id}_2of4.bmp"), photo)
+        folder = tmp_path / "Inputs" / "Groundup v4" / set_id
+        folder.mkdir(parents=True)
+        for direction in ("N", "S", "E", "W"):
+            cv2.imwrite(str(folder / f"{direction}.bmp"), photo)
+
+    tiles = pointer_direction_tiles(staged)
+    labels = [tile.label for tile in tiles]
+    assert labels[:4] == ["v1/N.bmp", "v1/S.bmp", "v1/E.bmp", "v1/W.bmp"]
+    assert all(tile.path.parent.name == tile.set_id for tile in tiles)
+    assert tiles[0].path.name == "N.bmp"
+
+    detections = pd.DataFrame(
+        [
+            {
+                "id": 1,
+                "source_tile": "v1_2of4.bmp",
+                "x_global": 100.0,
+                "y_global": 200.0,
+                "size": 20_000.0,
+                "confidence": 0.8,
+                "key": "v1_2of4_100_200",
+            }
+        ]
+    )
+    marks = pd.DataFrame(
+        [
+            {
+                "key": "v1_NSEW_300_400",
+                "source_tile": "v1/N.bmp",
+                "x_global": 300.0,
+                "y_global": 400.0,
+                "size": 15_000.0,
+                "confidence": 0.0,
+                "label": "particle",
+            },
+            {
+                "key": "v2_NSEW_300_400",
+                "source_tile": "v2/N.bmp",
+                "x_global": 300.0,
+                "y_global": 400.0,
+                "size": 15_000.0,
+                "confidence": 0.0,
+                "label": "particle",
+            },
+        ]
+    )
+    v1 = pointer_set_hits(detections, marks, "v1")
+    keys = set(v1["key"].astype(str))
+    assert keys == {"v1_2of4_100_200", "v1_NSEW_300_400"}
+    assert set(pointer_set_hits(detections, marks, "v2")["key"].astype(str)) == {"v2_NSEW_300_400"}

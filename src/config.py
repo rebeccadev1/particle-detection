@@ -104,7 +104,7 @@ def apply_nsew_settings(
 
 
 def save_nsew_overlay(overlay: dict[str, Any], path: str | Path | None = None) -> Path:
-    """Write N/S/E/W standard values for the sidebar checkbox."""
+    """Write N/S/E/W standard values for the sidebar NSEW toggle."""
     destination = nsew_config_path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     payload = deepcopy(overlay)
@@ -112,7 +112,7 @@ def save_nsew_overlay(overlay: dict[str, Any], path: str | Path | None = None) -
     text = yaml.safe_dump(payload, sort_keys=False, default_flow_style=False)
     destination.write_text(
         "# Groundup / N/S/E/W standard values.\n"
-        "# Sidebar checkbox: Apply NSEW settings.\n"
+        "# Sidebar toggle: NSEW.\n"
         f"{text}",
         encoding="utf-8",
     )

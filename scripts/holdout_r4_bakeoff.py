@@ -66,7 +66,7 @@ def run_classical(cfg: dict) -> Path:
     particles, mosaic = run_pipeline(cfg, progress_cb=progress)
     print(f"particles={len(particles)} in {time.time() - t0:.0f}s", flush=True)
     write_csv(particles, out / "particles.csv")
-    write_xlsx(particles, out / "particles.xlsx")
+    write_xlsx(particles, out / "particles.xlsx", cfg)
     print("stats", summary_stats(particles), flush=True)
     try:
         write_overlay_image(mosaic, particles, cfg, out / "mosaic_overlay.jpg")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -10,7 +11,7 @@ import cv2
 import numpy as np
 import pandas as pd
 
-from src.config import cfg_get
+from src.config import DEFAULT_INPUT_DIR, cfg_get
 from src.io.tile_loader import (
     DEFAULT_FILENAME_PATTERN,
     TILE_SUFFIXES,
@@ -21,7 +22,12 @@ from src.io.tile_loader import (
     resolve_input_dir,
     try_parse_tile_filename,
 )
-from src.measurement.measurer import DISPLAY_DIRECTION_ORDER, DIRECTION_STEMS, is_direction_tile
+from src.measurement.measurer import (
+    DISPLAY_DIRECTION_ORDER,
+    DIRECTION_STEMS,
+    is_direction_tile,
+    is_particles_only_tile,
+)
 from src.report.report_generator import _to_display_rgb
 from src.stitching.stitcher import LazyMosaic, TilePlacement, placement_from_tile
 
@@ -43,6 +49,7 @@ class ParticleCrop:
     crop_x0: int
     crop_y0: int
     tile_path: Path
+    direction: str = ""
 
 
 class TileImageCache:
@@ -96,19 +103,40 @@ def crop_window(
     min_half: int = MIN_HALF_PX,
     scale: float = WINDOW_SCALE,
 ) -> tuple[int, int, int, int]:
-    """Return ``(y0, x0, y1, x1)`` clamped to the tile."""
+    """Return ``(y0, x0, y1, x1)`` clamped to the tile.
+
+    A coordinate outside the tile stays a local window at the nearest edge.
+    It does not expand to the full tile width or height.
+    """
     half = max(int(min_half), int(round(float(scale) * float(diameter_px))))
-    cx = int(round(float(x_local)))
-    cy = int(round(float(y_local)))
-    x0 = max(0, cx - half)
-    y0 = max(0, cy - half)
-    x1 = min(int(width), cx + half)
-    y1 = min(int(height), cy + half)
-    if x1 <= x0:
-        x0, x1 = 0, int(width)
-    if y1 <= y0:
-        y0, y1 = 0, int(height)
+    cx = _clamp_index(int(round(float(x_local))), int(width))
+    cy = _clamp_index(int(round(float(y_local))), int(height))
+    x0, x1 = _local_span(cx, half, int(width))
+    y0, y1 = _local_span(cy, half, int(height))
     return y0, x0, y1, x1
+
+
+def _clamp_index(index: int, limit: int) -> int:
+    if limit <= 0:
+        return 0
+    return min(max(int(index), 0), limit - 1)
+
+
+def _local_span(center: int, half: int, limit: int) -> tuple[int, int]:
+    """Window of about ``2 * half`` pixels, shifted inside ``limit``."""
+    if limit <= 0:
+        return 0, 0
+    start = max(0, int(center) - int(half))
+    end = min(int(limit), int(center) + int(half))
+    if end <= start:
+        return 0, int(limit)
+    target = min(int(limit), 2 * int(half))
+    if end - start < target:
+        if start == 0:
+            end = min(int(limit), start + target)
+        elif end == int(limit):
+            start = max(0, end - target)
+    return start, end
 
 
 def draw_particle_circle(
@@ -139,6 +167,115 @@ def draw_particle_circle(
         lineType=cv2.LINE_AA,
     )
     return rgb
+
+
+def config_for_hit_placement(
+    config: dict[str, Any],
+    rows: pd.DataFrame | list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Copy ``config`` with the tile overlap that puts hits on their source tiles.
+
+    A detection table measured at 10% overlap is mis-placed when the sidebar
+    overlap is 0, and the orange circle is then drawn off the crop.
+    """
+    records = _placement_records(rows)
+    if not records:
+        return config
+    nominal = float(cfg_get(config, "overlap_fraction", 0.0) or 0.0)
+    geometry = _tile_geometry(records, config)
+    if not geometry:
+        return config
+    pixel_size = float(cfg_get(config, "pixel_size_nm", 960.0) or 960.0)
+    nominal_hits = _hits_inside(records, geometry, nominal, pixel_size)
+    if nominal_hits >= len(records):
+        return config
+    best_overlap = nominal
+    best_hits = nominal_hits
+    for step in range(0, 11):
+        overlap = step / 20.0
+        hits = _hits_inside(records, geometry, overlap, pixel_size)
+        if hits > best_hits:
+            best_overlap = overlap
+            best_hits = hits
+    if best_hits <= nominal_hits:
+        return config
+    updated = dict(config)
+    updated["overlap_fraction"] = best_overlap
+    return updated
+
+
+def _placement_records(rows: pd.DataFrame | list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if isinstance(rows, pd.DataFrame):
+        if rows.empty:
+            return []
+        records = rows.to_dict(orient="records")
+    else:
+        records = list(rows)
+    if len(records) <= 80:
+        return records
+    step = max(1, len(records) // 80)
+    return records[::step][:80]
+
+
+def _tile_geometry(
+    records: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> dict[str, tuple[float, float, float, float]]:
+    """Tile name → ``(row, col, height, width)`` for grid-named files."""
+    pattern = str(cfg_get(config, "filename_pattern", DEFAULT_FILENAME_PATTERN))
+    input_dir = cfg_get(config, "input_dir", None)
+    folders: dict[str, tuple[int, int]] = {}
+    geometry: dict[str, tuple[float, float, float, float]] = {}
+    for record in records:
+        name = Path(str(record.get("source_tile", "") or "")).name
+        if not name or name in geometry:
+            continue
+        try:
+            path = find_tile_path(name, input_dir=input_dir)
+        except (FileNotFoundError, OSError):
+            continue
+        meta = try_parse_tile_filename(path.name, pattern) or {}
+        if "row" not in meta or "col" not in meta:
+            continue
+        folder = str(path.parent.resolve())
+        if folder not in folders:
+            paths = matching_tile_paths(path.parent, pattern)
+            folders[folder] = _grid_index_origin(paths, pattern)
+        row_origin, col_origin = folders[folder]
+        height, width = peek_tile_hw(path)
+        geometry[name] = (
+            float(int(meta["row"]) - row_origin),
+            float(int(meta["col"]) - col_origin),
+            float(height),
+            float(width),
+        )
+    return geometry
+
+
+def _hits_inside(
+    records: list[dict[str, Any]],
+    geometry: dict[str, tuple[float, float, float, float]],
+    overlap: float,
+    pixel_size_nm: float = 960.0,
+) -> int:
+    scale = float(pixel_size_nm) if pixel_size_nm > 0 else 1.0
+    inside = 0
+    for record in records:
+        name = Path(str(record.get("source_tile", "") or "")).name
+        geom = geometry.get(name)
+        if geom is None:
+            continue
+        row_off, col_off, height, width = geom
+        try:
+            x_px = float(record["x_global"]) / scale
+            y_px = float(record["y_global"]) / scale
+        except (KeyError, TypeError, ValueError):
+            continue
+        x_local = x_px - col_off * width * (1.0 - overlap)
+        y_local = y_px - row_off * height * (1.0 - overlap)
+        if 0.0 <= x_local < width and 0.0 <= y_local < height:
+            inside += 1
+    return inside
 
 
 def find_tile_path(
@@ -199,18 +336,179 @@ def placement_for_tile(
     return _placement_from_path(tile_path, pattern, overlap, row_origin, col_origin)
 
 
+_STAGED_2OF4 = re.compile(r"(v\d+)_2of4$", re.IGNORECASE)
+_SET_DIR = re.compile(r"v\d+$", re.IGNORECASE)
+_GROUNDUP_SERIES = re.compile(r"Groundup v(\d+)", re.IGNORECASE)
+
+
+def direction_images_for_combined(tile_path: str | Path) -> dict[str, Path]:
+    """N/S/E/W files for a particles-only or staged 2-of-4 detection tile."""
+    path = Path(tile_path)
+    beside = list_direction_images(path.parent)
+    if len(beside) >= 2 and not is_direction_tile(path.name):
+        return beside
+    set_name = _set_name_for_combined(path)
+    if not set_name:
+        return {}
+    seen: set[Path] = set()
+    for folder in _direction_set_folders(path, set_name):
+        try:
+            key = folder.resolve()
+        except OSError:
+            key = folder
+        if key in seen:
+            continue
+        seen.add(key)
+        found = list_direction_images(folder)
+        if len(found) >= 2:
+            return found
+    return {}
+
+
+def _direction_set_folders(tile_path: Path, set_name: str) -> list[Path]:
+    """Set folders for this staged image, including ``v3 (10^5)`` exposure names.
+
+    A folder named ``Groundup v5 …`` stays on Groundup v5. Older staged files
+    with no series in the name still resolve to Groundup v4.
+    """
+    match = _GROUNDUP_SERIES.search(tile_path.parent.name)
+    series_names = [f"Groundup v{match.group(1)}"] if match else ["Groundup v4"]
+    folders: list[Path] = []
+    for series in series_names:
+        for root in (tile_path.parent.parent / series, DEFAULT_INPUT_DIR / series):
+            folders.extend(_set_folders_named(root, set_name))
+    return folders
+
+
+def _set_folders_named(root: Path, set_name: str) -> list[Path]:
+    if not root.is_dir():
+        return []
+    exact = root / set_name
+    if exact.is_dir():
+        return [exact]
+    pattern = re.compile(rf"^{re.escape(set_name)}(?:\s|\()", re.IGNORECASE)
+    return [
+        child
+        for child in sorted(root.iterdir())
+        if child.is_dir() and pattern.match(child.name)
+    ]
+
+
+def _set_name_for_combined(tile_path: Path) -> str | None:
+    match = _STAGED_2OF4.fullmatch(tile_path.stem)
+    if match:
+        return match.group(1)
+    if is_particles_only_tile(tile_path.name):
+        for parent in tile_path.parents:
+            if _SET_DIR.fullmatch(parent.name):
+                return parent.name
+    return None
+
+
+def _spot_brightness(image: np.ndarray, x: float, y: float, diameter_px: float) -> float:
+    """Mean intensity inside the particle disk. Higher means a brighter glint."""
+    gray = image if image.ndim == 2 else image.mean(axis=2)
+    radius = max(2.0, float(diameter_px) / 2.0)
+    height, width = int(gray.shape[0]), int(gray.shape[1])
+    x0 = max(0, int(np.floor(x - radius)))
+    x1 = min(width, int(np.ceil(x + radius)) + 1)
+    y0 = max(0, int(np.floor(y - radius)))
+    y1 = min(height, int(np.ceil(y + radius)) + 1)
+    if x1 <= x0 or y1 <= y0:
+        return -1.0
+    yy, xx = np.ogrid[y0:y1, x0:x1]
+    mask = (xx - x) ** 2 + (yy - y) ** 2 <= radius ** 2
+    patch = np.asarray(gray[y0:y1, x0:x1])
+    if not np.any(mask):
+        return -1.0
+    return float(patch[mask].mean())
+
+
+def brightest_direction_crop(
+    row: pd.Series | dict[str, Any],
+    config: dict[str, Any],
+    mosaic: LazyMosaic | None = None,
+    cache: TileImageCache | None = None,
+    origin_cache: dict[str, tuple[int, int]] | None = None,
+) -> ParticleCrop | None:
+    """Crop the N/S/E/W frame where this particles-only hit is brightest.
+
+    The circle stays on the same pixel as the combined detection. Returns
+    ``None`` when the hit is not a combined tile or the four angles are missing.
+    """
+    record = dict(row) if not isinstance(row, dict) else dict(row)
+    tile_name = str(record.get("source_tile", "") or "")
+    if is_direction_tile(tile_name):
+        return None
+    input_dir = cfg_get(config, "input_dir", None)
+    try:
+        combined_path = find_tile_path(tile_name, input_dir=input_dir, mosaic=mosaic)
+    except (FileNotFoundError, OSError):
+        return None
+    directions = direction_images_for_combined(combined_path)
+    if len(directions) < 2:
+        return None
+    placement = placement_for_tile(
+        combined_path, config, mosaic=mosaic, origin_cache=origin_cache
+    )
+    pixel_size = float(cfg_get(config, "pixel_size_nm", 1.0))
+    x_local, y_local = global_nm_to_local_px(
+        float(record["x_global"]),
+        float(record["y_global"]),
+        placement,
+        pixel_size,
+    )
+    diameter_px = float(record["size"]) / (pixel_size if pixel_size > 0 else 1.0)
+    loader = cache if cache is not None else TileImageCache()
+    best_name = ""
+    best_score = -1.0
+    for direction in DISPLAY_DIRECTION_ORDER:
+        path = directions.get(direction)
+        if path is None:
+            continue
+        score = _spot_brightness(loader.load(path), x_local, y_local, diameter_px)
+        if score > best_score:
+            best_score = score
+            best_name = direction
+    if not best_name:
+        return None
+    sibling = dict(record)
+    sibling["source_tile"] = directions[best_name].name
+    crop = crop_particle(
+        sibling,
+        config,
+        mosaic=mosaic,
+        cache=loader,
+        origin_cache=origin_cache,
+        tile_path=directions[best_name],
+    )
+    return ParticleCrop(
+        rgb=crop.rgb,
+        x_local=crop.x_local,
+        y_local=crop.y_local,
+        crop_x0=crop.crop_x0,
+        crop_y0=crop.crop_y0,
+        tile_path=crop.tile_path,
+        direction=best_name,
+    )
+
+
 def crop_particle(
     row: pd.Series | dict[str, Any],
     config: dict[str, Any],
     mosaic: LazyMosaic | None = None,
     cache: TileImageCache | None = None,
     origin_cache: dict[str, tuple[int, int]] | None = None,
+    tile_path: Path | None = None,
 ) -> ParticleCrop:
     """Load ``source_tile``, crop around the blob, and draw one red circle."""
     record = dict(row) if not isinstance(row, dict) else dict(row)
     tile_name = str(record["source_tile"])
     input_dir = cfg_get(config, "input_dir", None)
-    tile_path = find_tile_path(tile_name, input_dir=input_dir, mosaic=mosaic)
+    if tile_path is None:
+        tile_path = find_tile_path(tile_name, input_dir=input_dir, mosaic=mosaic)
+    else:
+        tile_path = Path(tile_path)
     placement = placement_for_tile(
         tile_path, config, mosaic=mosaic, origin_cache=origin_cache
     )

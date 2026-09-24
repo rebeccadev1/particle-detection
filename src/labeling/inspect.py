@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -24,12 +25,19 @@ from src.labeling.crops import (
     MIN_CIRCLE_RADIUS,
     MIN_HALF_PX,
     WINDOW_SCALE,
+    direction_images_for_combined,
     draw_particle_circle,
     find_tile_path,
     global_nm_to_local_px,
     placement_for_tile,
 )
-from src.labeling.queue import detection_key, label_map_with_aliases, nsew_key_aliases, tagged_if_needed
+from src.labeling.queue import (
+    detection_key,
+    expand_labeled_keys,
+    label_map_with_aliases,
+    nsew_key_aliases,
+    tagged_if_needed,
+)
 from src.measurement.measurer import (
     DIRECTION_STEMS,
     is_direction_tile,
@@ -129,6 +137,115 @@ def detections_on_tile(table: pd.DataFrame | None, tile_name: str) -> pd.DataFra
                 subset=["x_global", "y_global"], keep="first"
             )
     return hits.reset_index(drop=True)
+
+
+_STAGED_2OF4 = re.compile(r"^(v\d+)_2of4$", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class PointerTile:
+    """One N/S/E/W photo to show instead of a particles-only detection image."""
+
+    label: str
+    path: Path
+    set_id: str
+    direction: str
+
+
+def pointer_direction_tiles(folder: str | Path | None) -> list[PointerTile]:
+    """Directional photos for a staged ``vN_2of4`` detection folder.
+
+    Empty when the folder is a normal tile set. Order is v1 N, S, E, W, then v2.
+    """
+    resolved = _resolve_scene_folder(folder) if folder not in (None, "") else None
+    if resolved is None or not resolved.is_dir():
+        return []
+    staged: list[tuple[int, Path]] = []
+    try:
+        entries = list(resolved.iterdir())
+    except OSError:
+        return []
+    for path in entries:
+        match = _STAGED_2OF4.fullmatch(path.stem)
+        if path.is_file() and match and path.suffix.lower() in TILE_SUFFIXES:
+            staged.append((int(match.group(1)[1:]), path))
+    staged.sort(key=lambda item: item[0])
+    tiles: list[PointerTile] = []
+    for _, staged_path in staged:
+        directions = direction_images_for_combined(staged_path)
+        set_id = _STAGED_2OF4.fullmatch(staged_path.stem).group(1)
+        for direction in DIRECTION_STEMS:
+            image = directions.get(direction)
+            if image is None:
+                continue
+            tiles.append(
+                PointerTile(
+                    label=f"{set_id}/{direction}{image.suffix}",
+                    path=image,
+                    set_id=set_id,
+                    direction=direction,
+                )
+            )
+    return tiles
+
+
+def _pointer_set_mask(source: pd.Series, set_id: str) -> pd.Series:
+    text = source.astype(str).str.replace("\\", "/", regex=False)
+    base = text.map(_basename)
+    parent = text.map(lambda name: Path(name).parent.name)
+    combined = base.str.match(rf"{re.escape(set_id)}_2of4\.", case=False)
+    directional = parent.str.fullmatch(set_id, case=False) & base.map(is_direction_tile)
+    return combined | directional
+
+
+def pointer_set_hits(
+    detections: pd.DataFrame | None,
+    labels: pd.DataFrame | None,
+    set_id: str,
+) -> pd.DataFrame:
+    """Detections and missed marks for one field, shared by its N/S/E/W photos."""
+    hits = pd.DataFrame()
+    if detections is not None and not detections.empty and "source_tile" in detections.columns:
+        mask = _pointer_set_mask(detections["source_tile"], set_id)
+        hits = tagged_if_needed(detections.loc[mask].copy())
+        if not hits.empty and "key" in hits.columns:
+            hits = hits.drop_duplicates(subset=["key"], keep="first")
+    known = (
+        expand_labeled_keys(hits["key"].astype(str))
+        if not hits.empty and "key" in hits.columns
+        else set()
+    )
+    extra = _labels_for_pointer_set(labels, set_id)
+    if extra.empty:
+        return hits.reset_index(drop=True)
+    if "key" not in extra.columns:
+        extra = extra.copy()
+        extra["key"] = [detection_key(row) for row in extra.to_dict(orient="records")]
+    keep: list[dict[str, Any]] = []
+    for record in extra.to_dict(orient="records"):
+        aliases = nsew_key_aliases(str(record.get("key") or detection_key(record)))
+        if aliases.isdisjoint(known):
+            keep.append(record)
+            known.update(aliases)
+    if not keep:
+        return hits.reset_index(drop=True)
+    added = pd.DataFrame(keep)
+    if hits.empty:
+        return added.reset_index(drop=True)
+    return pd.concat([hits, added], ignore_index=True)
+
+
+def _labels_for_pointer_set(labels: pd.DataFrame | None, set_id: str) -> pd.DataFrame:
+    if labels is None or labels.empty:
+        return pd.DataFrame()
+    keys = labels["key"].astype(str) if "key" in labels.columns else pd.Series("", index=labels.index)
+    tile_mask = (
+        _pointer_set_mask(labels["source_tile"], set_id)
+        if "source_tile" in labels.columns
+        else pd.Series(False, index=labels.index)
+    )
+    key_mask = keys.str.startswith(f"{set_id}_NSEW_") | keys.str.startswith(f"{set_id}_2of4_")
+    return labels.loc[tile_mask | key_mask].copy()
 
 
 def labeled_detections(

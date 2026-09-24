@@ -1154,10 +1154,7 @@ def _gate_blob(
     particles_bright = bool(cfg_get(config, "detection.particles_bright", True))
     height, width = residual.shape
     radius = float(sigma) * float(np.sqrt(2.0))
-    dog_diameter = 2.0 * radius
     area = np.pi * radius**2
-    if dog_diameter < min_d or dog_diameter > max_d or area < min_area:
-        return None, "dog_size"
     iy, ix = int(round(y)), int(round(x))
     iy = min(max(iy, 0), height - 1)
     ix = min(max(ix, 0), width - 1)
@@ -1201,7 +1198,11 @@ def _gate_blob(
         bright=particles_bright,
         half=size_half,
     )
-    diameter = measured if measured > 0 else dog_diameter
+    # Size bounds apply only to the photo equivalent diameter. The DoG scale
+    # is a search scale and must not reject a peak on its own.
+    if measured <= 0:
+        return None, "measured_size"
+    diameter = measured
     measured_area = np.pi * (diameter * 0.5) ** 2
     if diameter < min_d or diameter > max_d or measured_area < min_area:
         return None, "measured_size"

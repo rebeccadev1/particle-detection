@@ -604,7 +604,7 @@ Later tiles overwrite earlier ones in overlap; there is no blending. That is fin
 
 Typical 5× tiles: **`pixel_size_nm: 960`** → **1 pixel = 0.96 µm**.
 
-Groundup / N/S/E/W images use **`pixel_size_nm: 3500`** (3.5 µm/px) via **Apply NSEW settings**.
+Groundup / N/S/E/W images use **`pixel_size_nm: 3500`** (3.5 µm/px) when the sidebar **NSEW** toggle is on.
 
 The UI talks in **µm**. The CSV and internal config talk in **nm**. Sidebar conversions: `nm = µm × 1000`.
 
@@ -640,7 +640,7 @@ Four images of the **same field** named `N`, `S`, `E`, `W` (any common suffix) u
 
 Outputs go to `Outputs/Output {folder name}/`. 2-of-4 is also written without the `_2of4` suffix.
 
-Detection of those combined images (and of the four raw angles) uses the main pipeline. **Apply NSEW settings** merges `nsew_config.yaml` on top of `config.yaml`: 3.5 µm/px, denoise σ 0.5, `blob_min_sigma` 9, `blob_threshold` 0.3, ML threshold **0.55**, same v5 model.
+Detection of those combined images (and of the four raw angles) uses the main pipeline. The sidebar **NSEW** toggle merges `nsew_config.yaml` on top of `config.yaml`: 3.5 µm/px, denoise σ 0.5, `blob_min_sigma` 9, `blob_threshold` 0.3, ML threshold **0.55**, same v5 model. Off restores `config.yaml`, whose v5 threshold is **0.39**.
 
 ---
 
@@ -734,7 +734,7 @@ Defaults below are from current `config.yaml` unless noted. The Streamlit sideba
 |-----|---------|--------|
 | `ml.enabled` | true | Score proposals. Raises if the joblib is missing. |
 | `ml.model_path` | `models/particle_clf_v5.joblib` | Relative to `particle_detection/`. Versioned; do not overwrite a vN file. |
-| `ml.threshold` | 0.0165 | Keep blobs with `P(particle)` ≥ this (v5 keep-all on R4 holdout). NSEW overlay uses **0.55**. |
+| `ml.threshold` | 0.39 | Keep blobs with `P(particle)` ≥ this (v5 on the R4 holdout: P = R = 0.878). NSEW overlay uses **0.55**. |
 | `ml.score_before_structure` | false | true = ML then cluster/line. false = cluster/line then ML. |
 | `ml.band_low` / `band_high` | 0.20 / 0.80 | Fallbacks if a cascade joblib has no stored band. CNN replaces HOG only inside the band. |
 
@@ -844,7 +844,7 @@ At inference (`apply_ml_filter`):
 
 Scoring a few dozen vectors (or patches) per tile is small next to DoG. `ml.enabled: true` with a missing joblib **raises**; it will not silently run classical-only.
 
-v5 at threshold **0.0165** is a keep-all setting on R4 holdout tiles (bake-off: 39 TP / 77 FP on the frozen winner). NSEW uses a much higher threshold (**0.55**).
+v5 at threshold **0.39** is the R4 holdout operating point (36 real, 5 fake, 5 missed; P = R = 0.878). NSEW uses a higher threshold (**0.55**) from the 2-of-4 sweep.
 
 Typical loop:
 
@@ -861,7 +861,7 @@ cd particle_detection
 streamlit run app.py
 ```
 
-Set the tile folder in the sidebar (or `input_dir` in `config.yaml`) and click **Run pipeline**. **Reset to standard values** restores every sidebar widget from `config.yaml`. **Apply NSEW settings** overlays `nsew_config.yaml`.
+Set the tile folder in the sidebar (or `input_dir` in `config.yaml`) and click **Run pipeline**. **Reset to standard values** restores every sidebar widget from `config.yaml` and turns the **NSEW** toggle off. Turning that toggle on overlays `nsew_config.yaml`.
 
 | Tab | Use |
 |-----|-----|

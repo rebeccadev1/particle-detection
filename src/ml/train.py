@@ -26,6 +26,7 @@ from sklearn.model_selection import GroupKFold, StratifiedKFold, cross_val_predi
 
 from src.config import DEFAULT_OUTPUT_DIR, PACKAGE_ROOT, cfg_get
 from src.io.tile_loader import DEFAULT_FILENAME_PATTERN
+from src.labeling.inspect import UNHAPPINESS_TARGET, unhappiness_score
 from src.labeling.queue import detection_key
 from src.ml.cnn import train_tiny_cnn
 from src.ml.features import FEATURE_COLUMNS, dataframe_feature_matrix
@@ -157,39 +158,75 @@ def _load_feature_tables(paths: list[str | Path]) -> pd.DataFrame:
     return combined
 
 
+def one_sided_unhappiness(precision: float, recall: float) -> float:
+    """Like unhappiness, but scores above 0.95 are not penalized."""
+    deficit_p = min(0.0, float(precision) - UNHAPPINESS_TARGET)
+    deficit_r = min(0.0, float(recall) - UNHAPPINESS_TARGET)
+    return 100.0 * (deficit_p**2 + deficit_r**2)
+
+
+def _f1(precision: float, recall: float) -> float:
+    total = float(precision) + float(recall)
+    if total <= 0:
+        return 0.0
+    return 2.0 * float(precision) * float(recall) / total
+
+
+def _metrics_at_threshold(
+    y_true: np.ndarray,
+    proba: np.ndarray,
+    threshold: float,
+) -> dict[str, float]:
+    pred = np.asarray(proba) >= float(threshold)
+    precision = float(precision_score(y_true, pred, zero_division=0))
+    recall = float(recall_score(y_true, pred, zero_division=0))
+    return {
+        "precision": precision,
+        "recall": recall,
+        "unhappiness": float(unhappiness_score(precision, recall)),
+        "one_sided_unhappiness": float(one_sided_unhappiness(precision, recall)),
+        "f1": float(_f1(precision, recall)),
+    }
+
+
 def choose_threshold(
     y_true: np.ndarray,
     proba: np.ndarray,
     min_recall: float = MIN_RECALL,
 ) -> tuple[float, dict[str, float]]:
-    """Lowest threshold that still meets ``min_recall``, maximizing precision."""
-    best_t = 0.0
-    best_prec = -1.0
-    best_rec = 0.0
-    fallback_t = 0.35
-    fallback_score = -1.0
-    for threshold in np.linspace(0.05, 0.9, 18):
-        pred = proba >= threshold
-        rec = float(recall_score(y_true, pred, zero_division=0))
-        prec = float(precision_score(y_true, pred, zero_division=0))
-        f2 = 0.0
-        denom = (4.0 * rec) + prec
-        if denom > 0:
-            f2 = (5.0 * prec * rec) / denom
-        if rec >= min_recall and prec > best_prec:
-            best_prec = prec
-            best_rec = rec
+    """Threshold on a 1% grid that minimizes unhappiness.
+
+    ``min_recall`` is accepted so older callers keep working. It no longer
+    forces the 95% recall operating point.
+    """
+    _ = min_recall
+    best_t = 0.35
+    best_metrics = _metrics_at_threshold(y_true, proba, best_t)
+    best_key = (
+        best_metrics["unhappiness"],
+        -best_metrics["f1"],
+        -best_t,
+    )
+    for threshold in np.round(np.arange(0.01, 1.0, 0.01), 2):
+        metrics = _metrics_at_threshold(y_true, proba, float(threshold))
+        key = (metrics["unhappiness"], -metrics["f1"], -float(threshold))
+        if key < best_key:
+            best_key = key
             best_t = float(threshold)
-        if f2 > fallback_score:
-            fallback_score = f2
-            fallback_t = float(threshold)
-    if best_prec < 0:
-        pred = proba >= fallback_t
-        return fallback_t, {
-            "precision": float(precision_score(y_true, pred, zero_division=0)),
-            "recall": float(recall_score(y_true, pred, zero_division=0)),
-        }
-    return best_t, {"precision": best_prec, "recall": best_rec}
+            best_metrics = metrics
+    return best_t, best_metrics
+
+
+def choose_f1_threshold(y_true: np.ndarray, proba: np.ndarray) -> float:
+    """Threshold on a 1% grid that maximizes F1."""
+    best_t = 0.50
+    best_f1 = -1.0
+    for threshold in np.round(np.arange(0.01, 1.0, 0.01), 2):
+        metrics = _metrics_at_threshold(y_true, proba, float(threshold))
+        if metrics["f1"] > best_f1:
+            best_f1 = metrics["f1"]
+            best_t = float(threshold)
+    return best_t
 
 
 def keep_all_threshold(y_true: np.ndarray, proba: np.ndarray) -> float:
@@ -236,7 +273,7 @@ def _trees() -> ExtraTreesClassifier:
         min_samples_leaf=2,
         class_weight="balanced",
         random_state=0,
-        n_jobs=1,
+        n_jobs=-1,
     )
 
 
@@ -379,8 +416,8 @@ def train_patch_classifier(
     if int(thresh_src_y.sum()) < 1:
         thresh_src_y, thresh_src_p = y, calibrated
     keep_all = keep_all_threshold(thresh_src_y, thresh_src_p)
-    precision_t, metrics = choose_threshold(thresh_src_y, thresh_src_p)
-    threshold = keep_all if hold_mask.any() else precision_t
+    threshold, metrics = choose_threshold(thresh_src_y, thresh_src_p)
+    f1_t = choose_f1_threshold(thresh_src_y, thresh_src_p)
     return {
         "kind": KIND_PATCH,
         "model": model,
@@ -390,7 +427,9 @@ def train_patch_classifier(
         "patch_size": PATCH_SIZE,
         "threshold": float(threshold),
         "threshold_keep_all": float(keep_all),
-        "threshold_precision": float(precision_t),
+        "threshold_precision": float(threshold),
+        "threshold_unhappiness": float(threshold),
+        "threshold_f1": float(f1_t),
         "metrics": metrics,
         "hog_metrics": metrics,
         "n_samples": int(len(y)),
@@ -449,7 +488,7 @@ def _select_cascade_band(
     hog_threshold: float,
     requested: tuple[float, float] | None = None,
 ) -> tuple[float, float, np.ndarray, float, dict[str, float], int]:
-    """Pick the HOG/CNN band with the best OOF precision at 95% recall."""
+    """Pick the HOG/CNN band that minimizes OOF unhappiness."""
     from src.ml.infer import combine_cascade_scores
 
     hog_t, hog_metrics = choose_threshold(y, hog_oof)
@@ -464,14 +503,18 @@ def _select_cascade_band(
     if requested is not None:
         options.append(requested)
     best: tuple[float, float, np.ndarray, float, dict[str, float], int] | None = None
-    best_key = (-1.0, -1.0, 1)
+    best_key = (-1e9, -1.0, 1)
     for lo, hi in options:
         uncertain = (hog_oof >= float(lo)) & (hog_oof < float(hi))
         combined = combine_cascade_scores(
             hog_oof, cnn_oof[uncertain], lo, hi, uncertain=uncertain
         )
         threshold, metrics = choose_threshold(y, combined)
-        key = (float(metrics["precision"]), float(metrics["recall"]), -int(uncertain.sum()))
+        key = (
+            -float(metrics["unhappiness"]),
+            float(metrics["f1"]),
+            -int(uncertain.sum()),
+        )
         if key > best_key:
             best_key = key
             best = (float(lo), float(hi), combined, float(threshold), metrics, int(uncertain.sum()))
@@ -639,7 +682,9 @@ def _print_artifact(artifact: dict[str, Any], saved: Path) -> None:
     if keep_all is not None or precision_t is not None:
         print(
             f"  keep_all={float(keep_all or 0):.3f}  "
-            f"precision={float(precision_t or 0):.3f}  "
+            f"min_unhappiness={float(artifact.get('threshold_unhappiness') or precision_t or 0):.3f}  "
+            f"max_f1={float(artifact.get('threshold_f1') or 0):.3f}  "
+            f"U={float(metrics.get('unhappiness', 0)):.2f}  "
             f"train={artifact.get('n_train', artifact['n_samples'])}  "
             f"holdout={artifact.get('n_holdout', 0)}",
             flush=True,

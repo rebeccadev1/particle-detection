@@ -1,7 +1,7 @@
 """Sweep Groundup v3 preprocess / detect / ML settings against labeled NSEW tiles.
 
 Orange (unlabeled) detector hits count as fake. Best settings are written to
-``nsew_config.yaml`` for the sidebar checkbox **Apply NSEW settings**.
+``nsew_config.yaml`` for the sidebar NSEW toggle.
 """
 
 from __future__ import annotations

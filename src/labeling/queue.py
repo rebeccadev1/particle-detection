@@ -32,6 +32,15 @@ _NSEW_KEY = re.compile(
     r"^(?:NSEW|N|S|E|W|particles_only(?:_\d+of4)?)_(-?\d+)_(-?\d+)$",
     re.IGNORECASE,
 )
+_SET_NSEW_KEY = re.compile(r"^(v\d+)_NSEW_(-?\d+)_(-?\d+)$", re.IGNORECASE)
+_SET_2OF4_KEY = re.compile(r"^(v\d+)_2of4_(-?\d+)_(-?\d+)$", re.IGNORECASE)
+_SET_2OF4_STEM = re.compile(r"^(v\d+)_2of4$", re.IGNORECASE)
+_SET_DIR_NAME = re.compile(r"v\d+$", re.IGNORECASE)
+# Same physical field at two exposures. Other folders keep every vN separate:
+# Groundup v4 v3 and v4 are different fields.
+EXPOSURE_FIELD_PAIRS: dict[str, tuple[tuple[str, str], ...]] = {
+    "Groundup v5 combi": (("v3", "v4"),),
+}
 _PARTICLES_ONLY_ALIASES = (
     "particles_only",
     "particles_only_2of4",
@@ -40,16 +49,35 @@ _PARTICLES_ONLY_ALIASES = (
 )
 
 
+def _set_id_from_tile(source_tile: str) -> str:
+    parent = Path(str(source_tile).replace("\\", "/")).parent.name
+    if _SET_DIR_NAME.fullmatch(parent):
+        return parent
+    return ""
+
+
+def _set_nsew_aliases(set_id: str, x_nm: str, y_nm: str) -> set[str]:
+    """One field's N/S/E/W and its 2-of-4 detection share a key. Other fields do not."""
+    aliases = {f"{set_id}_NSEW_{x_nm}_{y_nm}", f"{set_id}_2of4_{x_nm}_{y_nm}"}
+    aliases.update(f"{set_id}_{stem}_{x_nm}_{y_nm}" for stem in DIRECTION_STEMS)
+    return aliases
+
+
 def detection_key(row: Mapping[str, Any] | pd.Series) -> str:
     """Stable id across runs: tile plus rounded global coordinates.
 
     N/S/E/W and particles-only versions of the same location share one key
-    so a label on any of them applies to the others.
+    so a label on any of them applies to the others. A ``v1/N.bmp`` label
+    stays on that field (``v1_NSEW_…``) and is not mixed with ``v2``.
     """
-    tile = Path(str(row["source_tile"])).name
+    raw = str(row["source_tile"]).replace("\\", "/")
+    tile = Path(raw).name
     x_nm = int(round(float(row["x_global"])))
     y_nm = int(round(float(row["y_global"])))
     if is_nsew_family_tile(tile):
+        set_id = _set_id_from_tile(raw)
+        if set_id:
+            return f"{set_id}_NSEW_{x_nm}_{y_nm}"
         return f"NSEW_{x_nm}_{y_nm}"
     return f"{Path(tile).stem}_{x_nm}_{y_nm}"
 
@@ -57,6 +85,9 @@ def detection_key(row: Mapping[str, Any] | pd.Series) -> str:
 def nsew_key_aliases(key: str) -> set[str]:
     """All keys that mean the same N/S/E/W / particles-only location."""
     text = str(key)
+    set_match = _SET_NSEW_KEY.fullmatch(text) or _SET_2OF4_KEY.fullmatch(text)
+    if set_match is not None:
+        return _set_nsew_aliases(set_match.group(1), set_match.group(2), set_match.group(3))
     match = _NSEW_KEY.fullmatch(text)
     if match is None:
         return {text}
@@ -304,6 +335,83 @@ def merge_detection_tables(tables: Iterable[pd.DataFrame]) -> pd.DataFrame:
     return pd.DataFrame([merged[key] for key in order])
 
 
+def _exposure_set_id(source_tile: str) -> str:
+    stem = Path(str(source_tile).replace("\\", "/")).stem
+    match = _SET_2OF4_STEM.fullmatch(stem)
+    if match is None:
+        return ""
+    return match.group(1).lower()
+
+
+def _exposure_folder_name(folder: str) -> str:
+    return Path(str(folder).replace("\\", "/")).name
+
+
+def share_exposure_keys(
+    detections: pd.DataFrame | None,
+    folder: str,
+    merge_radius_nm: float,
+    size_match_fraction: float = DEFAULT_NSEW_SIZE_MATCH_FRACTION,
+) -> pd.DataFrame:
+    """Give nearby hits on two exposures of one field the same label key.
+
+    Both rows stay, so each exposure still draws the circle. ``exposure_keep``
+    is false on the partner row; the queue keeps the anchor only.
+    """
+    if detections is None or detections.empty:
+        return detections if detections is not None else pd.DataFrame()
+    pairs = EXPOSURE_FIELD_PAIRS.get(_exposure_folder_name(folder))
+    if not pairs or "source_tile" not in detections.columns:
+        return detections
+    tagged = tagged_if_needed(detections).copy()
+    if "exposure_keep" not in tagged.columns:
+        tagged["exposure_keep"] = True
+    if "exposure_with" not in tagged.columns:
+        tagged["exposure_with"] = ""
+    set_ids = tagged["source_tile"].astype(str).map(_exposure_set_id)
+    xy = tagged[["x_global", "y_global"]].astype(float).to_numpy()
+    sizes = (
+        tagged["size"].astype(float).to_numpy()
+        if "size" in tagged.columns
+        else np.zeros(len(tagged))
+    )
+    keys = tagged["key"].astype(str).to_numpy()
+    keep = tagged["exposure_keep"].fillna(True).astype(bool).to_numpy()
+    with_set = tagged["exposure_with"].astype(str).to_numpy()
+    for left_id, right_id in pairs:
+        left = np.flatnonzero((set_ids == left_id.lower()).to_numpy())
+        right = np.flatnonzero((set_ids == right_id.lower()).to_numpy())
+        if len(left) == 0 or len(right) == 0:
+            continue
+        left_nn_dist, left_nn = cKDTree(xy[right]).query(xy[left], k=1)
+        right_nn = cKDTree(xy[left]).query(xy[right], k=1)[1]
+        for local_i, local_j in enumerate(np.atleast_1d(left_nn)):
+            i = int(left[int(local_i)])
+            j = int(right[int(local_j)])
+            if int(np.atleast_1d(right_nn)[int(local_j)]) != int(local_i):
+                continue
+            limit = float(merge_radius_nm)
+            if size_match_fraction > 0:
+                limit = max(limit, float(size_match_fraction) * max(float(sizes[i]), float(sizes[j])))
+            if float(np.atleast_1d(left_nn_dist)[int(local_i)]) > limit:
+                continue
+            keys[j] = keys[i]
+            keep[j] = False
+            with_set[i] = right_id
+            with_set[j] = left_id
+    tagged["key"] = keys
+    tagged["exposure_keep"] = keep
+    tagged["exposure_with"] = with_set
+    return tagged
+
+
+def _drop_exposure_partners(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame is None or frame.empty or "exposure_keep" not in frame.columns:
+        return frame
+    keep = frame["exposure_keep"].map(lambda value: value not in (False, 0, "False", "false"))
+    return frame.loc[keep.fillna(True)].reset_index(drop=True)
+
+
 def unlabeled_queue(
     tables: Iterable[pd.DataFrame],
     labeled_keys: Iterable[str],
@@ -313,6 +421,7 @@ def unlabeled_queue(
     labels: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Detections at or above the size floor that are not yet in the label store."""
+    tables = [_drop_exposure_partners(frame) for frame in tables]
     merged = merge_detection_tables(tables)
     if merged.empty:
         return merged

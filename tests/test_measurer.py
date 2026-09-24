@@ -381,6 +381,11 @@ def test_pipeline_runs_on_bmp_tiles(tmp_path: Path) -> None:
     table, mosaic = run_pipeline(config)
     assert [p.name for p in mosaic.placements] == ["R3_0_1_5X.bmp"]
     assert set(table["source_tile"].astype(str)) == {"R3_0_1_5X.bmp"}
+    book = pd.read_excel(tmp_path / "out" / "particles.xlsx", sheet_name=None)
+    assert list(book) == ["particles", "parameters"]
+    saved = dict(zip(book["parameters"]["parameter"], book["parameters"]["value"]))
+    assert saved["preprocessing.denoise"] is False
+    assert saved["detection.method"] == "tophat"
 
 
 def test_pipeline_progress_reports_before_first_tile(tmp_path: Path) -> None:

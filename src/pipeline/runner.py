@@ -287,12 +287,18 @@ def _combine_particle_tables(
 def run_pipeline(
     config: dict[str, Any],
     progress_cb: ProgressCallback | None = None,
+    *,
+    write_outputs: bool = True,
 ) -> tuple[pd.DataFrame, LazyMosaic]:
     """Run detection on each tile without retaining full-resolution images.
 
     Returns the de-duplicated particle table and a lazy mosaic for reporting.
     Mosaic thumbnails are generated during the detection pass when the overlay
     downsample factor is greater than 1.
+
+    When ``write_outputs`` is true and ``output_dir`` is set, writes
+    ``particles.csv`` and ``particles.xlsx``. The workbook's second sheet is
+    the preprocessing and detection settings used for this run.
     """
     config = with_recall_profile(config)
     folder = cfg_get(config, "input_dir", "")
@@ -388,7 +394,20 @@ def run_pipeline(
         thumbnails=thumbnails or None,
         thumbnail_factor=thumb_factor if thumbnails else None,
     )
+    if write_outputs:
+        _write_run_outputs(table, config)
     return table, mosaic
+
+
+def _write_run_outputs(table: pd.DataFrame, config: dict[str, Any]) -> None:
+    """Save the particle table and the settings that produced it."""
+    if not str(cfg_get(config, "output_dir", "") or "").strip():
+        return
+    from src.io.results_writer import write_csv, write_xlsx
+
+    csv_path, _json_path, xlsx_path = default_output_paths(config)
+    write_csv(table, csv_path)
+    write_xlsx(table, xlsx_path, config)
 
 
 def default_output_paths(config: dict[str, Any]) -> tuple[Path, Path, Path]:

@@ -12,7 +12,7 @@ from typing import Any
 import pandas as pd
 
 from src.config import load_config, resolve_output_dir
-from src.io.results_writer import write_csv
+from src.io.results_writer import write_csv, write_xlsx
 from src.labeling.crops import find_tile_path, global_nm_to_local_px, placement_for_tile
 from src.pipeline.runner import run_pipeline
 from src.report.report_generator import write_overlay_image
@@ -244,7 +244,7 @@ def run_trial(
 ) -> dict[str, Any]:
     print(f"\n=== {trial_id} ===", flush=True)
     t0 = time.time()
-    table, mosaic_obj = run_pipeline(cfg, progress_cb=_progress)
+    table, mosaic_obj = run_pipeline(cfg, progress_cb=_progress, write_outputs=False)
     elapsed = time.time() - t0
     metrics = score_table(table, gold, cfg)
     metrics["trial_id"] = trial_id
@@ -258,6 +258,7 @@ def run_trial(
     )
     if save_particles:
         write_csv(table, out / "particles.csv")
+        write_xlsx(table, out / "particles.xlsx", cfg)
         table.to_pickle(out / "particles.pkl")
     if mosaic:
         try:

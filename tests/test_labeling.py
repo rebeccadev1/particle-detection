@@ -10,6 +10,7 @@ import pandas as pd
 from src.labeling.crops import (
     CIRCLE_COLOR,
     TileImageCache,
+    config_for_hit_placement,
     crop_direction_views,
     crop_particle,
     crop_window,
@@ -23,6 +24,7 @@ from src.labeling.queue import (
     filter_min_size,
     tag_table,
     unlabeled_queue,
+    nsew_key_aliases,
 )
 from src.labeling.store import LabelStore
 from src.stitching.stitcher import TilePlacement
@@ -80,6 +82,34 @@ def test_crop_window_clamps_to_tile_edges() -> None:
     assert 0 < x1 <= 90
     assert y1 - y0 <= 80
     assert x1 - x0 <= 90
+
+
+def test_hit_placement_overlap_puts_the_circle_on_the_crop(tmp_path: Path) -> None:
+    image = np.zeros((80, 100), dtype=np.float32)
+    write_tile_tiff(tmp_path / "R3_1_1_5X.tif", image)
+    write_tile_tiff(tmp_path / "R3_1_2_5X.tif", image)
+    row = {
+        "id": 1,
+        "source_tile": "R3_1_2_5X.tif",
+        "x_global": 95.0,
+        "y_global": 40.0,
+        "size": 10.0,
+        "confidence": 1.0,
+    }
+    config = _config(tmp_path, pixel_size_nm=1.0)
+    config["overlap_fraction"] = 0.0
+    placed = config_for_hit_placement(config, pd.DataFrame([row]))
+    assert float(placed["overlap_fraction"]) > 0.0
+    crop = crop_particle(row, placed)
+    assert int(_red_mask(crop.rgb).sum()) > 20
+
+
+def test_crop_window_stays_local_when_point_is_outside_the_tile() -> None:
+    y0, x0, y1, x1 = crop_window(-5000.0, 229.0, diameter_px=40.0, height=2076, width=3088)
+    assert x1 - x0 == 192
+    assert y1 - y0 == 192
+    assert x0 == 0
+    assert y0 <= 229 < y1
 
 
 def test_crop_contains_blob_and_clamps_at_edge(tmp_path: Path) -> None:
@@ -349,6 +379,67 @@ def test_crop_direction_views_shows_nwes(tmp_path: Path) -> None:
     assert all(view.rgb.size > 0 for view in views.values())
 
 
+def test_brightest_direction_crop_picks_the_bright_angle(tmp_path: Path) -> None:
+    import cv2
+
+    from src.labeling.crops import brightest_direction_crop
+
+    angles = tmp_path / "Inputs" / "Groundup v4" / "v3"
+    stage = tmp_path / "Inputs" / "Groundup v4 ML off"
+    angles.mkdir(parents=True)
+    stage.mkdir()
+    for name, value in (("N", 20), ("S", 40), ("E", 220), ("W", 30)):
+        gray = np.full((64, 64), 5, dtype=np.uint8)
+        if name == "E":
+            gray[28:36, 28:36] = value
+        assert cv2.imwrite(str(angles / f"{name}.bmp"), gray)
+    mask = np.zeros((64, 64), dtype=np.uint8)
+    assert cv2.imwrite(str(stage / "v3_2of4.bmp"), mask)
+    row = {
+        "id": 1,
+        "source_tile": "v3_2of4.bmp",
+        "x_global": 32.0,
+        "y_global": 32.0,
+        "size": 8.0,
+        "confidence": 0.9,
+    }
+    crop = brightest_direction_crop(row, _config(stage))
+    assert crop is not None
+    assert crop.direction == "E"
+    assert crop.tile_path.name == "E.bmp"
+    assert _red_mask(crop.rgb).any()
+
+
+def test_brightest_direction_crop_uses_groundup_v5_exposure_folder(tmp_path: Path) -> None:
+    import cv2
+
+    from src.labeling.crops import brightest_direction_crop
+
+    angles = tmp_path / "Inputs" / "Groundup v5" / "v3 (10^5)"
+    stage = tmp_path / "Inputs" / "Groundup v5 combi"
+    angles.mkdir(parents=True)
+    stage.mkdir()
+    for name, value in (("N", 20), ("S", 40), ("E", 220), ("W", 30)):
+        gray = np.full((64, 64), 5, dtype=np.uint8)
+        if name == "E":
+            gray[28:36, 28:36] = value
+        assert cv2.imwrite(str(angles / f"{name}.png"), gray)
+    mask = np.zeros((64, 64), dtype=np.uint8)
+    assert cv2.imwrite(str(stage / "v3_2of4.png"), mask)
+    row = {
+        "id": 1,
+        "source_tile": "v3_2of4.png",
+        "x_global": 32.0,
+        "y_global": 32.0,
+        "size": 8.0,
+        "confidence": 0.9,
+    }
+    crop = brightest_direction_crop(row, _config(stage))
+    assert crop is not None
+    assert crop.direction == "E"
+    assert crop.tile_path.parent == angles
+
+
 def test_store_round_trip_and_undo(tmp_path: Path) -> None:
     store = LabelStore(tmp_path / "labels")
     rgb = np.zeros((24, 24, 3), dtype=np.uint8)
@@ -376,6 +467,37 @@ def test_store_round_trip_and_undo(tmp_path: Path) -> None:
     assert key not in store.labeled_keys()
     assert not dest.is_file()
     assert store.by_label("particle").empty
+
+
+def test_store_apply_labels_writes_particle_and_not_particle(tmp_path: Path) -> None:
+    store = LabelStore(tmp_path / "labels")
+    rgb = np.zeros((16, 16, 3), dtype=np.uint8)
+    particle = {
+        "id": 1,
+        "source_tile": "R3_1_1_5X.tif",
+        "x_global": 10.0,
+        "y_global": 20.0,
+        "size": 20_000.0,
+        "confidence": 0.9,
+    }
+    other = {
+        "id": 2,
+        "source_tile": "R3_1_1_5X.tif",
+        "x_global": 80.0,
+        "y_global": 90.0,
+        "size": 25_000.0,
+        "confidence": 0.4,
+    }
+    dests = store.apply_labels(
+        [(particle, "particle", rgb), (other, "not_particle", rgb)]
+    )
+    assert len(dests) == 2
+    assert all(path.is_file() for path in dests)
+    counts = store.counts()
+    assert counts["particle"] == 1
+    assert counts["not_particle"] == 1
+    assert detection_key(particle) in store.labeled_keys()
+    assert detection_key(other) in store.labeled_keys()
 
 
 def test_last_run_csv_queue_floor_is_10_um() -> None:
@@ -438,3 +560,43 @@ def test_load_last_pipeline_uses_pointer_not_recall_csv(tmp_path: Path) -> None:
     found, run_config = load_last_pipeline({"input_dir": "other"}, pointer_dir=tmp_path)
     assert found == csv_path.resolve()
     assert run_config["input_dir"] == "My tiles"
+
+
+def test_set_scoped_nsew_label_stays_on_one_field() -> None:
+    north = {
+        "source_tile": "v1/N.bmp",
+        "x_global": 100.0,
+        "y_global": 200.0,
+        "size": 20_000.0,
+        "confidence": 0.0,
+    }
+    assert detection_key(north) == "v1_NSEW_100_200"
+    assert detection_key({**north, "source_tile": "v1/S.bmp"}) == "v1_NSEW_100_200"
+    assert detection_key({**north, "source_tile": "v2/N.bmp"}) == "v2_NSEW_100_200"
+    assert detection_key({**north, "source_tile": "N.bmp"}) == "NSEW_100_200"
+    aliases = nsew_key_aliases("v1_NSEW_100_200")
+    assert "v1_2of4_100_200" in aliases
+    assert "NSEW_100_200" not in aliases
+    assert "v2_2of4_100_200" not in aliases
+    detections = pd.DataFrame(
+        [
+            {
+                "id": 1,
+                "source_tile": "v1_2of4.bmp",
+                "x_global": 100.0,
+                "y_global": 200.0,
+                "size": 20_000.0,
+                "confidence": 0.8,
+            },
+            {
+                "id": 2,
+                "source_tile": "v2_2of4.bmp",
+                "x_global": 100.0,
+                "y_global": 200.0,
+                "size": 20_000.0,
+                "confidence": 0.8,
+            },
+        ]
+    )
+    queue = unlabeled_queue([tag_table(detections)], ["v1_NSEW_100_200"])
+    assert list(queue["key"].astype(str)) == ["v2_2of4_100_200"]
