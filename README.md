@@ -1,4 +1,4 @@
-# Particle Detection (TL;DR)
+# Particle Detection (TL;DR) 
 
 This app finds particles on darkfield images of a patterned wafer. It photographs the wafer and runs detection. How the detector actually works is all written down in [getting_started/HOW_IT_WORKS.md](getting_started/HOW_IT_WORKS.md), if you're interested :).
 
