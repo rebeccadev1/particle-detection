@@ -1,0 +1,101 @@
+input_dir: ""
+output_dir: ""
+filename_pattern: '\((?P<row>\d+),(?P<col>\d+)\)\.(?:tiff?|bmp|png|jpe?g)'
+run: ""
+magnification: ""
+overlap_fraction: 0.1
+pixel_size_nm: 3610.0
+
+pipeline:
+  workers: 10
+
+preprocessing:
+  denoise: true
+  denoise_sigma: 1.0
+  contrast_stretch: true
+  contrast_percentiles: [1.0, 99.0]
+  flatten_illumination: true
+  flatten_sigma: 160.0
+
+detection:
+  method: fft
+  particles_bright: true
+  fft_peak_threshold: 0.35
+  fft_notch_radius: 3
+  # per_tile: notch each tile from its own spectrum. shared: reuse paths[0].
+  fft_mask: per_tile
+  tophat_radius: 50
+  blob_method: dog
+  min_size_nm: 20000.0
+  max_size_nm: 100000.0
+  # Reported size is ECD on the photo: pixels that stand out from the
+  # local background by this fraction of (peak - background).
+  size_mass_fraction: 0.4
+  blob_min_sigma: 3.7
+  blob_max_sigma: 36.0
+  blob_num_sigma: 5
+  blob_sigma_ratio: 1.4
+  blob_threshold: 0.12
+  min_prominence: 0.30
+  min_area_px: 4
+  # Compact residual islands on a layout ridge: ≥40 µm always; ≥20 µm only
+  # if the ridge is a single edge (not a pad-corner L-junction).
+  island_min_nm: 20000.0
+  island_large_nm: 40000.0
+  island_max_aspect: 3.0
+  island_min_solidity: 0.35
+  island_open_px: 4
+  # Drop blobs whose residual-at-peak (confidence, 0–1) is below this.
+  min_confidence: 0.50
+  # 0 = auto (3.5 × blob_max_sigma). Local energy envelope for SNR scaling.
+  local_snr_sigma: 0.0
+  edge_soften_sigma: 12.0
+  edge_soften_strength: 2.0
+  # Dead zone around area borders (px). Stops DoG from beading just inside boxes.
+  # Uniform uses 8 px; NSEW overlay keeps 12 px.
+  edge_exclude_px: 8.0
+  # Ignore compact gradient rings; keep only borders at least this long.
+  edge_min_length_px: 40.0
+  # Inertia-ratio circularity; 0 disables.
+  min_circularity: 0.0
+  # Drop blobs that have this many neighbors within structure_neighbor_px (chains/grids).
+  structure_neighbor_px: 48.0
+  structure_min_neighbors: 3
+  # Keep a clustered blob if it is this × the median neighbor size (layout beads).
+  structure_size_ratio: 1.30
+  # Drop long horizontal/vertical rows of blobs (remaining box frames). 0 disables.
+  structure_line_bin_px: 10.0
+  structure_line_min_run: 3
+  structure_line_min_span_px: 48.0
+  # A row is not a frame if it has a hole larger than this (px).
+  structure_line_max_gap_px: 48.0
+
+measurement:
+  merge_radius_px: 8.0
+  size_aggregation: max
+  # N/W/E/S hits of the same flake merge if closer than this × the larger diameter.
+  nsew_size_match_fraction: 0.4
+  # Extra search radius (px) for pairing the same location across N/W/E/S tiles.
+  nsew_merge_radius_px: 24.0
+
+# ExtraTrees post-filter on DoG hits. Switch versions here; do not overwrite a vN file.
+ml:
+  enabled: true
+  model_path: src/analyse/models/particle_clf_v4_residual.joblib
+  # Uniform beta-1 preset. NSEW overlay uses v8 at 0.37.
+  threshold: 0.23
+  # Off: cluster/line first, then ML. On can add lattice neighbors that cluster-kill flakes.
+  score_before_structure: false
+
+# Label tab prefers this particles.csv (under Outputs/) then falls back.
+labeling:
+  source_csv: recall/particles.csv
+
+report:
+  downsample: 0
+  target_mb: 20.0
+  f_beta: 1.0
+  beta_presets:
+    - beta: 1.0
+      model_path: src/analyse/models/particle_clf_v4_residual.joblib
+      threshold: 0.23

@@ -1,0 +1,59 @@
+# Overlay when the sidebar NSEW toggle is on. Merged on top of config.yaml.
+pixel_size_nm: 3610.0
+preprocessing:
+  denoise: true
+  denoise_sigma: 1.0
+  flatten_illumination: true
+  flatten_sigma: 160.0
+  contrast_stretch: true
+  contrast_percentiles:
+    - 0.1
+    - 99.9
+detection:
+  method: fft
+  particles_bright: true
+  fft_peak_threshold: 0.35
+  fft_notch_radius: 3
+  fft_mask: per_tile
+  tophat_radius: 25
+  blob_method: dog
+  min_size_nm: 20000.0
+  max_size_nm: 100000.0
+  size_mass_fraction: 0.4
+  blob_min_sigma: 3.7
+  blob_max_sigma: 36.0
+  blob_num_sigma: 5
+  blob_sigma_ratio: 1.4
+  blob_threshold: 0.12
+  min_prominence: 0.30
+  min_area_px: 4
+  island_min_nm: 20000.0
+  island_large_nm: 40000.0
+  island_max_aspect: 3.0
+  island_min_solidity: 0.35
+  island_open_px: 4
+  min_confidence: 0.50
+  local_snr_sigma: 0.0
+  edge_soften_sigma: 12.0
+  edge_soften_strength: 2.0
+  # Wider border drop than Uniform (8 px) and a looser neighbour gate (Uniform uses 3).
+  edge_exclude_px: 12.0
+  edge_min_length_px: 40.0
+  min_circularity: 0.0
+  structure_neighbor_px: 48.0
+  structure_min_neighbors: 2
+  structure_size_ratio: 1.30
+  structure_line_bin_px: 10.0
+  structure_line_min_run: 3
+  structure_line_min_span_px: 48.0
+  structure_line_max_gap_px: 48.0
+ml:
+  enabled: true
+  model_path: src/analyse/models/particle_clf_v8.joblib
+  threshold: 0.37
+report:
+  f_beta: 1.0
+  beta_presets:
+    - beta: 1.0
+      model_path: src/analyse/models/particle_clf_v8.joblib
+      threshold: 0.37

@@ -1,0 +1,191 @@
+#!/bin/bash
+# Launcher. A copy in the project runs Streamlit itself. A copy in
+# /Applications is not allowed to execute files on the Desktop, so that
+# copy asks Terminal to start the same project.
+set -u
+
+LOG="${HOME}/Library/Logs/ParticleDetection.log"
+URL="http://127.0.0.1:8502"
+HOST="127.0.0.1"
+PORT=8502
+PROJECT_FILE="${HOME}/Library/Application Support/ParticleDetection/project_dir"
+
+mkdir -p "$(dirname "$LOG")"
+
+log() {
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"
+}
+
+notify() {
+  /usr/bin/osascript - "$1" >/dev/null 2>&1 <<'APPLESCRIPT' || true
+on run argv
+  display alert "Particle Detection" message (item 1 of argv)
+end run
+APPLESCRIPT
+}
+
+fail() {
+  log "$*"
+  notify "$*"
+  exit 1
+}
+
+port_open() {
+  /usr/bin/nc -z -G 1 "$HOST" "$PORT" >/dev/null 2>&1
+}
+
+listener_pid() {
+  /usr/sbin/lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1
+}
+
+listener_cwd() {
+  /usr/sbin/lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1
+}
+
+# A second click should open the browser only when this project is already
+# serving. A listener whose folder was moved (for example into the Trash)
+# still owns the port, but Streamlit cannot read that directory, so the page
+# stays on the loading spinner. Stop that process and start this project.
+reclaim_port() {
+  local pid cwd cmd i
+  pid="$(listener_pid || true)"
+  [[ -n "${pid}" ]] || return 0
+  cwd="$(listener_cwd "$pid" || true)"
+  cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  if [[ "$cwd" == "$APP_DIR" && "$cmd" == *"streamlit run app.py"* ]]; then
+    log "127.0.0.1:${PORT} is already serving ${APP_DIR}; opening the browser"
+    open "$URL"
+    exit 0
+  fi
+  if [[ "$cmd" == *"streamlit"* && "$cmd" == *"app.py"* ]]; then
+    log "127.0.0.1:${PORT} is a stale Streamlit (pid ${pid}, cwd ${cwd:-unknown}); stopping it"
+    kill "$pid" 2>/dev/null || true
+    i=0
+    while [[ "$i" -lt 20 ]]; do
+      pid="$(listener_pid || true)"
+      [[ -z "${pid}" ]] && return 0
+      i=$((i + 1))
+      sleep 0.25
+    done
+    kill -9 "$pid" 2>/dev/null || true
+    sleep 0.3
+    pid="$(listener_pid || true)"
+    [[ -z "${pid}" ]] || fail "could not free port ${PORT} (pid ${pid})"
+    return 0
+  fi
+  fail "port ${PORT} is already used by pid ${pid}"
+}
+
+BUNDLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)" || fail "could not locate the app bundle"
+# The .app lives in getting_started/. app.py and .venv stay in the project root.
+if [[ -f "${BUNDLE_DIR}/app.py" ]]; then
+  PROJECT_DIR="$BUNDLE_DIR"
+else
+  PROJECT_DIR="$(cd "${BUNDLE_DIR}/.." && pwd)" || fail "could not locate the project folder"
+fi
+
+if [[ -x "${PROJECT_DIR}/.venv/bin/streamlit" && -f "${PROJECT_DIR}/app.py" ]]; then
+  APP_DIR="$PROJECT_DIR"
+  mkdir -p "$(dirname "$PROJECT_FILE")"
+  printf '%s\n' "$APP_DIR" > "$PROJECT_FILE"
+elif [[ -f "$PROJECT_FILE" ]]; then
+  SAVED_PROJECT="$(head -n 1 "$PROJECT_FILE" || true)"
+  if [[ -n "${SAVED_PROJECT}" && -x "${SAVED_PROJECT}/.venv/bin/streamlit" && -f "${SAVED_PROJECT}/app.py" ]]; then
+    APP_DIR="$SAVED_PROJECT"
+  else
+    fail "missing .venv/bin/streamlit (looked in ${PROJECT_DIR} and ${SAVED_PROJECT:-$PROJECT_FILE})"
+  fi
+else
+  fail "missing .venv/bin/streamlit (looked in ${PROJECT_DIR}; run the in-project .app once to remember the folder)"
+fi
+
+STREAMLIT="${APP_DIR}/.venv/bin/streamlit"
+if [[ ! -x "$STREAMLIT" ]]; then
+  fail "missing .venv/bin/streamlit (${STREAMLIT})"
+fi
+
+reclaim_port
+
+# The python symlink lives in Homebrew, which is allowed. The Streamlit
+# script itself is in the project; /Applications cannot execute that.
+perm_file="$(mktemp /tmp/particle-detection-perm.XXXXXX)"
+if ! "$STREAMLIT" --version >"$perm_file" 2>&1; then
+  if grep -q "Operation not permitted" "$perm_file"; then
+    rm -f "$perm_file"
+    log "macOS blocked this app from running the project; starting Terminal"
+    runner="$(mktemp /tmp/ParticleDetection.XXXXXX).command"
+    cat > "$runner" << EOF
+#!/bin/bash
+set -u
+cd "$APP_DIR" || exit 1
+LOG="$LOG"
+URL="$URL"
+STREAMLIT="$APP_DIR/.venv/bin/streamlit"
+port_open() {
+  "$APP_DIR/.venv/bin/python" -c '
+import socket
+import sys
+sock = socket.socket()
+sock.settimeout(0.5)
+try:
+    sock.connect(("127.0.0.1", 8502))
+except OSError:
+    sys.exit(1)
+else:
+    sys.exit(0)
+finally:
+    sock.close()
+'
+}
+if port_open; then
+  open "\$URL"
+  exit 0
+fi
+(
+  i=0
+  while [[ "\$i" -lt 60 ]]; do
+    i=\$((i + 1))
+    if port_open; then
+      open "\$URL"
+      exit 0
+    fi
+    sleep 0.5
+  done
+  printf '%s Streamlit did not accept connections on 127.0.0.1:8502 within 30 seconds\n' "\$(date '+%Y-%m-%d %H:%M:%S')" >> "\$LOG"
+) </dev/null &
+printf '%s starting Streamlit on %s from %s\n' "\$(date '+%Y-%m-%d %H:%M:%S')" "\$URL" "$APP_DIR" >> "\$LOG"
+exec "\$STREAMLIT" run app.py --server.headless true --server.address 127.0.0.1 --server.port 8502 >> "\$LOG" 2>&1
+EOF
+    chmod 755 "$runner"
+    open -a Terminal "$runner" || fail "could not open Terminal to start Streamlit"
+    exit 0
+  fi
+  detail="$(tail -n 1 "$perm_file")"
+  rm -f "$perm_file"
+  fail "could not run ${STREAMLIT}: ${detail}"
+fi
+rm -f "$perm_file"
+
+cd "$APP_DIR" || fail "could not open ${APP_DIR}"
+
+(
+  i=0
+  while [[ "$i" -lt 60 ]]; do
+    i=$((i + 1))
+    if port_open; then
+      open "$URL"
+      exit 0
+    fi
+    sleep 0.5
+  done
+  log "Streamlit did not accept connections on ${HOST}:${PORT} within 30 seconds"
+  notify "Streamlit did not start on ${URL}. See ${LOG}."
+) </dev/null &
+
+log "starting Streamlit on ${URL} from ${APP_DIR}"
+exec "$STREAMLIT" run app.py \
+  --server.headless true \
+  --server.address "$HOST" \
+  --server.port "$PORT" \
+  >> "$LOG" 2>&1
+fail "failed to start ${STREAMLIT}"

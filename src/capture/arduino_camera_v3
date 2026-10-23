@@ -1,0 +1,142 @@
+/*
+  Microscope ring light — automated segment control (non-addressable version)
+  --------------------------------------------------------------
+  Four separate LED strips, each switched by a transistor whose base
+  is driven by its own Arduino digital pin.
+
+  Send a segment number as ASCII text followed by a newline
+  (e.g. "0\n" ... "3\n") over serial (9600 baud) and the Arduino
+  immediately lights that quadrant and replies "OK <n>".
+
+  Commands:
+    0..N-1  light only that quadrant
+    n       advance to the next quadrant
+    f       all quadrants on
+    x       all quadrants off
+    pN      2x2 mode: quadrant N + the opposite one, e.g. "p1"
+
+  >>> amountOfQuadrants below MUST match the amountOfQuadrants
+      variable in the Python script. <<<
+
+  Wiring (per quadrant), assuming an NPN transistor (low-side switch):
+    Arduino pin -> ~1 kOhm resistor -> transistor base
+    Transistor emitter   -> supply GND (also tied to Arduino GND!)
+    Transistor collector -> LED strip GND (-)
+    LED strip +          -> supply + (e.g. 5V / 12V, matching the strip)
+
+  If you use logic-level N-MOSFETs instead, wire gate to the pin (with a
+  ~100 ohm series resistor and a ~10k pulldown to GND) and the code is unchanged.
+*/
+
+const int amountOfQuadrants = 4;   // must match Python
+
+// One digital pin per quadrant, in physical order around the ring
+const uint8_t QUAD_PINS[amountOfQuadrants] = { 2, 3, 4, 5 };
+
+// HIGH turns an NPN transistor / N-MOSFET on.
+// Swap these two if your switching stage is inverted (e.g. PNP / P-MOSFET).
+#define LED_ON   HIGH
+#define LED_OFF  LOW
+
+int quadrant = 0;
+
+void setup() {
+  Serial.begin(9600);
+  Serial.setTimeout(50);
+
+  for (int i = 0; i < amountOfQuadrants; i++) {
+    pinMode(QUAD_PINS[i], OUTPUT);
+    digitalWrite(QUAD_PINS[i], LED_OFF);
+  }
+
+  showQuadrant(quadrant);
+
+  // Let Python know we're alive
+  Serial.println("READY");
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    // Read a full line, e.g. "3\n"
+    String line = Serial.readStringUntil('\n');
+    line.trim();
+
+    if (line.length() == 0) {
+      return;
+    }
+
+    if (line == "x") {
+      // Everything off, useful between runs
+      allOff();
+      Serial.println("OK OFF");
+      return;
+    }
+
+    if (line == "n") {
+      // Relative advance
+      quadrant = (quadrant + 1) % amountOfQuadrants;
+      showQuadrant(quadrant);
+      Serial.print("OK ");
+      Serial.println(quadrant);
+      return;
+    }
+
+    if (line == "f") {
+      // All quadrants on
+      for (int i = 0; i < amountOfQuadrants; i++) {
+        digitalWrite(QUAD_PINS[i], LED_ON);
+      }
+      Serial.println("OK ALL");
+      return;
+    }
+
+    if (line.startsWith("p")) {
+      // 2x2 mode: one quadrant + the opposite one, e.g. "p1"
+      int requested = line.substring(1).toInt();
+      if (requested >= 0 && requested < amountOfQuadrants) {
+        quadrant = requested;
+        showPair(quadrant);
+        Serial.print("OK PAIR ");
+        Serial.print(quadrant);
+        Serial.print("+");
+        Serial.println((quadrant + amountOfQuadrants / 2) % amountOfQuadrants);
+      } else {
+        Serial.print("ERR out of range: ");
+        Serial.println(line);
+      }
+      return;
+    }
+
+    // Otherwise treat it as a direct segment number
+    int requested = line.toInt();
+    if (requested >= 0 && requested < amountOfQuadrants) {
+      quadrant = requested;
+      showQuadrant(quadrant);
+      Serial.print("OK ");
+      Serial.println(quadrant);
+    } else {
+      Serial.print("ERR out of range: ");
+      Serial.println(line);
+    }
+  }
+}
+
+void allOff() {
+  for (int i = 0; i < amountOfQuadrants; i++) {
+    digitalWrite(QUAD_PINS[i], LED_OFF);
+  }
+}
+
+void showQuadrant(int q) {
+  // Turn the requested one on and the rest off
+  for (int i = 0; i < amountOfQuadrants; i++) {
+    digitalWrite(QUAD_PINS[i], (i == q) ? LED_ON : LED_OFF);
+  }
+}
+
+void showPair(int q) {
+  int opposite = (q + amountOfQuadrants / 2) % amountOfQuadrants;
+  for (int i = 0; i < amountOfQuadrants; i++) {
+    digitalWrite(QUAD_PINS[i], (i == q || i == opposite) ? LED_ON : LED_OFF);
+  }
+}

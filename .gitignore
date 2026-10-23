@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+output/
+.streamlit/*
+!.streamlit/config.toml
+src/analyse/models/*.joblib
+!src/analyse/models/particle_clf_v*.joblib
+.DS_Store
+labels/
+src/capture/captures/
