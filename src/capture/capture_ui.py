@@ -17,7 +17,6 @@ next_run_folder = _camera.next_run_folder
 
 
 def _load_arduino_link() -> dict:
-    """Keep the open Arduino across a script reload so the port is not opened twice."""
     shared = getattr(builtins, "_asml_arduino_link", None)
     if isinstance(shared, dict) and "ser" in shared:
         return shared
@@ -30,14 +29,12 @@ _LINK = _load_arduino_link()
 
 CAPTURE_WIDGET_DEFAULTS: dict = {
     "capture_mode": "Uniform",
-    "capture_nsew_style": "Automatic",
     "capture_total_uniform": _camera.TOTAL_EXPOSURE_MS,
     "capture_total_nsew": _camera.NSEW_TOTAL_EXPOSURE_MS,
 }
 
 
 def keep_capture_inputs() -> None:
-    """Call on every run. Streamlit drops widget values while this tab is hidden."""
     for key in CAPTURE_WIDGET_DEFAULTS:
         held = f"_held_{key}"
         if key in st.session_state:
@@ -74,7 +71,6 @@ def _forget_port() -> None:
 
 
 def _run_serial(action):
-    """Run a command on the open port. A dead port is dropped so Connect works again."""
     ser = _serial()
     if ser is None:
         st.error("Connect the Arduino first.")
@@ -99,7 +95,6 @@ def _total_exposure_key(mode: str) -> str:
 
 
 def total_exposure_ms(mode: str | None = None) -> float:
-    """Shutter for this lighting mode. NSEW's standard is eight times Uniform."""
     mode = _selected_mode() if mode is None else mode
     key = _total_exposure_key(mode)
     default = CAPTURE_WIDGET_DEFAULTS[key]
@@ -109,16 +104,10 @@ def total_exposure_ms(mode: str | None = None) -> float:
 def _apply_mode_light(cap, mode: str):
     if mode == "Uniform":
         return _run_serial(cap.light_all)
-    return _run_serial(cap.lights_off)
-
-
-def _nsew_style() -> str:
-    style = st.session_state.get("capture_nsew_style", "Automatic")
-    return style if style in ("Automatic", "Manual") else "Automatic"
+    return _run_serial(lambda port: cap.set_segment(port, 0))
 
 
 def _failure(action: str, next_step: str, exc: BaseException) -> None:
-    """Operator-facing failure. The exception text stays behind a disclosure."""
     detail = str(exc).strip() or type(exc).__name__
     first = detail.splitlines()[0]
     if len(first) > 160 or "Traceback" in detail:
@@ -148,7 +137,6 @@ def _marked_port(device: str, labels: dict[str, str], roles: dict[str, str]) -> 
 
 
 def _render_port_select(cap, *, label: str, state_key: str, disabled: bool) -> bool:
-    """Port list with taken ports marked. False when pyserial is missing."""
     try:
         ports = cap.list_serial_ports()
     except ImportError:
@@ -175,7 +163,6 @@ def _render_port_select(cap, *, label: str, state_key: str, disabled: bool) -> b
 
 
 def _hardware_strip() -> None:
-    """One line for Arduino, printer, and camera. Not a banner per device."""
     printer = printer_status()
     snap = preview_snapshot()
     capture = scan_capture_status()
@@ -205,26 +192,17 @@ def _hardware_strip() -> None:
 
 
 def render_capture_tab() -> None:
-    """Uniform lighting, or one side at a time. One total-exposure control."""
     cap = _capture_module()
     _hardware_strip()
     _capture_after_autofocus(cap)
     with st.container(border=True, key="block-capture"):
         st.header("Lighting")
         mode = st.radio(
-            "Select mode",
+            "Mode",
             ("Uniform", "NSEW"),
             horizontal=True,
             key="capture_mode",
         )
-        nsew_style = "Automatic"
-        if mode == "NSEW":
-            nsew_style = st.radio(
-                "NSEW capture",
-                ("Automatic", "Manual"),
-                horizontal=True,
-                key="capture_nsew_style",
-            )
 
         ser = _serial()
         ports_ready = _render_port_select(
@@ -234,7 +212,7 @@ def render_capture_tab() -> None:
             disabled=ser is not None,
         )
         if ports_ready:
-            _render_lighting_controls(cap, mode, nsew_style, ser)
+            _render_lighting_controls(cap, mode, ser)
 
     live_col, last_col = st.columns(2)
     with live_col:
@@ -246,7 +224,7 @@ def render_capture_tab() -> None:
     render_stage(cap)
 
 
-def _render_lighting_controls(cap, mode: str, nsew_style: str, ser) -> None:
+def _render_lighting_controls(cap, mode: str, ser) -> None:
     refresh_col, connect_col, disconnect_col = st.columns(3)
     if refresh_col.button("Refresh ports", key="refresh_arduino_port", width="stretch"):
         st.rerun()
@@ -268,8 +246,8 @@ def _render_lighting_controls(cap, mode: str, nsew_style: str, ser) -> None:
                     cap.light_all(opened)
                     ack = "OK ALL"
                 else:
-                    cap.lights_off(opened)
-                    ack = "OK OFF"
+                    cap.set_segment(opened, 0)
+                    ack = "OK 0"
             except Exception as exc:
                 if opened is not None:
                     try:
@@ -333,91 +311,17 @@ def _render_lighting_controls(cap, mode: str, nsew_style: str, ser) -> None:
         if st.button("Capture", type="primary", disabled=blocked is not None):
             _capture_run(cap, mode, shutter)
         _caption_when_blocked("Capture", blocked)
-    elif nsew_style == "Automatic":
-        st.caption(
-            "One click lights N, then E, then S, then W, and saves each frame. "
-            f"It waits {cap.NSEW_GAP_S * 1000:.0f} ms between sides."
-        )
+    else:
+        _render_side_lights(cap, ser)
         blocked = _still_capture_block_reason(needs_arduino=True)
-        if st.button("Capture N, E, S, W", type="primary", disabled=blocked is not None):
+        if st.button("Capture", type="primary", disabled=blocked is not None):
             _capture_run(cap, mode, shutter)
         _caption_when_blocked("Capture", blocked)
-    else:
-        _render_manual_sides(cap, shutter)
 
-
-
-def _manual_target(cap) -> tuple[Path, int, int]:
-    current = st.session_state.get("capture_manual_folder")
-    row = st.session_state.get("capture_manual_row")
-    col = st.session_state.get("capture_manual_col")
-    if current and Path(current).is_dir() and row and col:
-        return Path(current), int(row), int(col)
-    run = cap.allocate_run_folder(cap.CAPTURES_DIR)
-    st.session_state["capture_manual_folder"] = str(run)
-    st.session_state["capture_manual_row"] = 1
-    st.session_state["capture_manual_col"] = 1
-    return run, 1, 1
-
-
-def _capture_one_side(cap, index: int, shutter_ms: float) -> None:
-    ser = _serial()
-    if ser is None:
-        st.error("Connect the Arduino first.")
-        return
-    exposure_us = shutter_ms * 1000.0
-    camera = None
-    try:
-        direction = cap.DIRECTIONS[index]
-        with st.spinner(f"Capturing {direction}…"):
-            stop_preview()
-            camera, converter = cap.open_camera(exposure_us)
-            folder, row, col = _manual_target(cap)
-            filename = cap.capture_side(
-                camera,
-                converter,
-                ser,
-                folder,
-                index,
-                cap.grab_timeout_ms(exposure_us),
-                row,
-                col,
-            )
-            cap.write_manifest(
-                folder,
-                {
-                    "mode": "nsew",
-                    "row": row,
-                    "col": col,
-                    "total_exposure_ms": total_exposure_ms(),
-                    "shutter_ms": shutter_ms,
-                    "exposure_us": exposure_us,
-                    "sides_on": 1,
-                    "port": _LINK.get("port"),
-                    "files": [filename],
-                    "stage": _stage_record(),
-                },
-            )
-    except Exception as exc:
-        _failure("The picture was not saved.", "The camera is free again. Take the shot again.", exc)
-        return
-    finally:
-        cap.shutdown(camera, None)
-        start_preview(cap, exposure_us)
-    st.session_state["capture_last_run"] = {
-        "folder": str(folder),
-        "files": [cap.image_filename(row, col, name) for name in cap.DIRECTIONS],
-        "mode": "NSEW manual",
-    }
-    _LINK["ack"] = f"OK {index}"
-    st.caption(f"Saved {filename} to {folder}")
 
 
 def _capture_run(cap, mode: str, shutter_ms: float, *, label: str | None = None) -> None:
     ser = _serial()
-    if mode != "Uniform" and ser is None:
-        st.error("NSEW capture needs the Arduino to switch sides.")
-        return
     exposure_us = shutter_ms * 1000.0
     timeout_ms = cap.grab_timeout_ms(exposure_us)
     camera = None
@@ -478,8 +382,6 @@ def _still_capture_block_reason(*, needs_arduino: bool) -> str | None:
     busy = _camera_busy_reason()
     if busy:
         return busy
-    if needs_arduino and _serial() is None:
-        return "NSEW capture needs the Arduino."
     return None
 
 
@@ -488,59 +390,20 @@ def _caption_when_blocked(action: str, reason: str | None) -> None:
         st.caption(f"{action} is off: {reason}")
 
 
-def _manual_set(cap) -> tuple[Path | None, int, int, list[str]]:
-    """Folder and sides already saved for the open manual set. Does not create one."""
-    current = st.session_state.get("capture_manual_folder")
-    row = st.session_state.get("capture_manual_row")
-    col = st.session_state.get("capture_manual_col")
-    if not current or not row or not col:
-        return None, 0, 0, []
-    folder = Path(current)
-    if not folder.is_dir():
-        return None, 0, 0, []
-    row_i, col_i = int(row), int(col)
-    saved = [
-        direction
-        for direction in cap.DIRECTIONS
-        if (folder / cap.image_filename(row_i, col_i, direction)).is_file()
-    ]
-    return folder, row_i, col_i, saved
-
-
-def _render_manual_sides(cap, shutter_ms: float) -> None:
-    """One button per side, with the open set listed beside them."""
-    blocked = _still_capture_block_reason(needs_arduino=True)
-    folder, row, col, saved = _manual_set(cap)
-    st.caption("Each button lights that side and adds it to this set.")
+def _render_side_lights(cap, ser) -> None:
+    busy = _camera_busy_reason()
+    disabled = ser is None or busy is not None
     side_cols = st.columns(len(cap.DIRECTIONS))
     for index, direction in enumerate(cap.DIRECTIONS):
         if side_cols[index].button(
-            direction,
+            f"Turn {direction} on",
             key=f"capture_side_{direction}",
-            disabled=blocked is not None,
+            disabled=disabled,
             width="stretch",
         ):
-            _capture_one_side(cap, index, shutter_ms)
-    if folder is None:
-        st.caption("No set yet. The first side starts a folder.")
-    else:
-        marks = " · ".join(
-            f"{direction} saved" if direction in saved else f"{direction} not taken"
-            for direction in cap.DIRECTIONS
-        )
-        st.caption(f"This set is `{folder.name}`, stop ({row},{col}). {marks}.")
-    if st.button(
-        "New set",
-        disabled=folder is None or blocked is not None,
-        help="Pictures already saved stay on disk. The next side starts a new folder.",
-    ):
-        st.session_state.pop("capture_manual_folder", None)
-        st.session_state.pop("capture_manual_row", None)
-        st.session_state.pop("capture_manual_col", None)
-        st.rerun()
-    if folder is not None:
-        st.caption("New set keeps these files and starts the next side in a new folder.")
-    _caption_when_blocked("Side capture", blocked)
+            _run_serial(lambda port, index=index: cap.set_segment(port, index))
+    if busy:
+        st.caption(f"Side lights are off: {busy}")
 
 
 def _shutter_ms(cap) -> float:
@@ -548,7 +411,6 @@ def _shutter_ms(cap) -> float:
 
 
 def _capture_after_autofocus(cap) -> None:
-    """Save a still once a standalone autofocus has finished on the best height."""
     if scan_capture_status()["running"]:
         return
     if not claim_focus_capture():
@@ -580,7 +442,6 @@ def _show_last_run(*, key: str = "block-last-capture") -> None:
 
 
 def suspend_live_view() -> None:
-    """Close the camera when the Capture tab is not on screen."""
     stop_preview()
 
 
@@ -613,4 +474,4 @@ def _render_live(cap, shutter_ms: float) -> None:
         _live_feed()
 
 
-from src.capture.capture_stage import keep_stage_inputs, render_stage
+from src.capture.capture_stage import _stage_record, keep_stage_inputs, render_stage

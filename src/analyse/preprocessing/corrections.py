@@ -1,5 +1,3 @@
-"""Per-tile illumination, contrast, and denoise corrections (pure functions)."""
-
 from __future__ import annotations
 
 from typing import Any
@@ -17,12 +15,7 @@ _MEDIAN_SAMPLE = 250_000
 
 
 def to_float(image: np.ndarray) -> np.ndarray:
-    """Convert a tile to float32 in [0, 1] on the file's full scale.
-
-    An 8-bit photo is divided by 255 and a 16-bit photo by 65535. The brightest
-    pixel in this image is not the scale: that would lift a dark photo before
-    denoise, flatten, and the contrast stretch.
-    """
+    
     array = np.asarray(image)
     if array.size == 0:
         return np.asarray(array, dtype=_FLOAT)
@@ -41,7 +34,7 @@ def to_float(image: np.ndarray) -> np.ndarray:
 
 
 def _gaussian_blur(image: np.ndarray, sigma: float) -> np.ndarray:
-    """Separable Gaussian blur. ``sigma`` is in pixels of ``image``."""
+    
     array = np.ascontiguousarray(image, dtype=_FLOAT)
     if sigma <= 0:
         return array
@@ -55,14 +48,11 @@ def _gaussian_blur(image: np.ndarray, sigma: float) -> np.ndarray:
 
 
 def denoise(image: np.ndarray, sigma: float) -> np.ndarray:
-    """Gaussian denoise; ``sigma`` is in pixels."""
-    if sigma <= 0:
-        return np.ascontiguousarray(image, dtype=_FLOAT)
     return _gaussian_blur(image, sigma)
 
 
 def _approx_percentiles(image: np.ndarray, p_low: float, p_high: float) -> tuple[float, float]:
-    """Percentiles via a histogram for large tiles; exact sort for small ones."""
+    
     array = np.asarray(image, dtype=_FLOAT)
     if array.size == 0:
         return 0.0, 1.0
@@ -87,7 +77,7 @@ def _approx_percentiles(image: np.ndarray, p_low: float, p_high: float) -> tuple
 
 
 def contrast_stretch(image: np.ndarray, p_low: float, p_high: float) -> np.ndarray:
-    """Percentile contrast stretch to [0, 1]."""
+    
     low, high = _approx_percentiles(image, p_low, p_high)
     array = np.asarray(image, dtype=_FLOAT)
     if high <= low:
@@ -97,7 +87,7 @@ def contrast_stretch(image: np.ndarray, p_low: float, p_high: float) -> np.ndarr
 
 
 def _approx_median(image: np.ndarray) -> float:
-    """Median via a systematic subsample so large tiles skip a full sort."""
+    
     array = np.asarray(image).reshape(-1)
     if array.size == 0:
         return 0.0
@@ -108,7 +98,7 @@ def _approx_median(image: np.ndarray) -> float:
 
 
 def _flatten_factor(height: int, width: int, sigma: float) -> int:
-    """Downsample factor for a slowly varying illumination field."""
+    
     max_factor = min(
         _FLATTEN_DOWNSAMPLE,
         max(height // 16, 1),
@@ -119,12 +109,7 @@ def _flatten_factor(height: int, width: int, sigma: float) -> int:
 
 
 def flatten_illumination(image: np.ndarray, sigma: float) -> np.ndarray:
-    """Divide by a large-scale Gaussian estimate of illumination.
-
-    The illumination field varies slowly, so the blur is computed at reduced
-    resolution and bilinearly upsampled. That preserves the divide-by-field
-    model without a 300-tap full-res kernel.
-    """
+    
     array = np.ascontiguousarray(image, dtype=_FLOAT)
     if sigma <= 0:
         return array
@@ -151,7 +136,7 @@ def flatten_illumination(image: np.ndarray, sigma: float) -> np.ndarray:
 
 
 def apply_corrections(image: np.ndarray, config: dict[str, Any]) -> np.ndarray:
-    """Apply configured preprocessing steps. Array in, array out; no I/O."""
+    
     result = to_float(image)
     if cfg_get(config, "preprocessing.denoise", True):
         result = denoise(result, float(cfg_get(config, "preprocessing.denoise_sigma", 1.0)))

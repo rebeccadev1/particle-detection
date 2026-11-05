@@ -15,7 +15,7 @@ Images land in `ASML SE/Inputs`. Detection writes to `ASML SE/Outputs`.
 
 ## Capture
 
-Capture drives three devices, shown on one status line: the **Arduino** (ring light), the **printer** (the stage), and the **camera**. The Arduino and the printer need different serial ports.
+Capture drives three devices, shown on one status line: the **Arduino** (ring light), the **printer** (the stage), and the **camera**. The Arduino and the printer need different serial ports. On Windows those ports are `COM` numbers. A CH340 board needs the WCH driver, and a Basler USB camera needs the pylon Camera Software Suite driver. The stage uses Printrun 2.2.0 (`python -m pip install --no-deps "Printrun==2.2.0"`), or a pipx Pronterface install on Mac or Windows.
 
 ### Lighting
 
@@ -31,7 +31,7 @@ The left column is the live camera. The right column is the last saved capture. 
 
 The stage is a 3D-printer bed. You can jog it, then set the scan: field of view in millimetres, overlap fraction, columns, rows, and travel speed. The step size is the field of view times `(1 − overlap)`. The path is a serpentine: odd rows go left to right, even rows start at the right edge and walk back. The G-code for the current settings can be downloaded as `scanwafer.gcode`.
 
-**Focus** hill-climbs Z from the current height using the live image. **Check and correct focus during the scan** scores the frame after every seventh stage step and runs autofocus. If the best score stays at or below 80% of the sharpness at the start of that search, autofocus runs again. Leave the checkbox off to keep the current Z for the whole scan.
+**Focus** hill-climbs Z from the current height using the live image. **Check and correct focus during the scan** scores the frame after every fifth stage step and runs autofocus. If the best score stays at or below 80% of the sharpness at the start of that search, autofocus runs again. Leave the checkbox off to keep the current Z for the whole scan.
 
 **Scan and capture** moves through the grid and saves a picture at each stop, using the lighting mode and total exposure already chosen. Stop ends the scan. Sharpness at each stop, and each autofocus move, is written to `sharpness.json`.
 
@@ -56,9 +56,9 @@ Analyse places those names on a grid. The overlap you set here should match `ove
 
 ### What you do
 
-**Adjust parameters** holds the detector settings. The profile is **Uniform** or **NSEW**. Uniform loads `config/config.yaml`. NSEW overlays `config/nsew_config.yaml` on top of it. **Reset to standard values** restores the selected profile and keeps the folder you just chose.
+**Adjust parameters** holds the detector settings. The mode is **Uniform** or **NSEW**, and the wafer is **Patterned** or **Empty**. Uniform loads `config/config.yaml`. NSEW overlays `config/nsew_config.yaml` on top of it. **Reset to standard values** restores the selected mode and keeps the folder you just chose. Patterned uses that mode's ML model. Empty turns the ML filter off.
 
-**Run/stop pipeline** detects on the input folder and writes the output folder. When it finishes, the page shows the particle table, a size histogram in micrometres, the mosaic, and any image that was detected but could not be placed on the grid.
+**Run/stop pipeline** detects on the input folder and writes the output folder. When it finishes, the page shows the particle table, a size histogram in micrometres, the mosaic, and any image that was detected but could not be placed on the grid. Opening Analyse again shows **Load last run** until that saved run is loaded.
 
 Set the tile folder to a Capture run (`Inputs/Groundup/vN …`) or to any other folder of tiles. A bare folder name is resolved under `ASML SE/Inputs`.
 
@@ -88,7 +88,7 @@ Before detection, a complete N/S/E/W set is combined and the four source images 
 - Files named `N`, `S`, `E`, `W` (or Groundup `quad0`–`quad3`) become `combi_2of4` beside them.
 - Files named `(row,col)_N` and the other three sides become `(row,col)`, which is placed on the grid.
 
-The combi keeps pixels that are bright in at least two of the four angles, after a wide illumination flatten (σ 120, only in this combine step). `python src/analyse/nsew_to_combi.py` is separate: it writes 2-of-4, 3-of-4, and 4-of-4 combi and symmetry maps under `Outputs/Output {folder}`.
+The detection image is still named `combi_2of4`. It keeps pixels that agree in at least three of the four angles, with no illumination flatten and a display gain of 1. `python src/analyse/nsew_to_combi.py` is separate: it writes 2-of-4, 3-of-4, and 4-of-4 combi and symmetry maps under `Outputs/Output {folder}`.
 
 On each image the worker:
 
@@ -96,22 +96,28 @@ On each image the worker:
 2. Denoises (σ 1 px), flattens slow illumination (σ 160 px), and stretches contrast.
 3. Removes a periodic lattice with an FFT notch built on **this** tile. If the spectrum has no lattice peaks, it uses a white top-hat instead. Area borders survive both and are handled next.
 4. Boosts compact blobs relative to long edges (local SNR, FFT residuals only), then softens a band around long region borders. A compact residual island on a single edge (≥ 20 µm) or a large flake (≥ 40 µm) is protected so a real particle on a die step is not erased. Pad-corner L-junctions are not protected.
-5. Finds blobs with difference-of-Gaussians (LoG if `blob_method` is `log`).
+5. Finds blobs with difference-of-Gaussians.
 6. Drops peaks that fail, in order: residual prominence, confidence, distance to a border, circularity, a local peak on the preprocessed tile, compact support, then measured size.
 7. Drops clusters and long axis-aligned rows of equal-sized hits. A blob much larger than its neighbours is kept.
-8. Optionally scores the survivors with a frozen ExtraTrees model. Uniform uses residual features (`src/analyse/models/particle_clf_v4_residual.joblib`, threshold **0.23**). The NSEW profile uses `src/analyse/models/particle_clf_v8.joblib` at **0.37**. A missing joblib raises. The app does not train.
+8. Optionally scores the survivors with a frozen ExtraTrees model. **Beta** in Adjust parameters chooses the row in `report.beta_presets` for the selected mode, and that row sets the model and threshold. The default beta is **1.0**. Both modes then use `src/analyse/models/particle_clf_v8.joblib` at **0.31**. A missing joblib raises. The app does not train. Patch and cascade models are rejected.
 
 Reported **size** is the equivalent circular diameter of the footprint on the **raw photo**, not the DoG sigma. Pixels that stand out from the local background by `size_mass_fraction` (0.4) of the peak contrast form that footprint. The keep window is **20–100 µm**.
 
-DoG itself searches pixel scales σ **3.7–36** (about 10–100 px across). Those sigmas were chosen when 1 px was 0.96 µm. At the current `pixel_size_nm: 3610` (3.61 µm/px) the same sigmas search about **38–368 µm**, so the 20 µm floor sits below the search and the 100 µm ceiling still cuts large DoG hits.
+DoG searches the scales that match the size window. Diameter is about 2.8 times sigma, and sigma is in pixels, so it follows min size, max size, and pixel size. At `pixel_size_nm: 3610` (3.61 µm/px) the 20–100 µm window is about σ **1.96–9.79**.
 
 Placeable names match `filename_pattern`. Current `config/config.yaml` is `(row,col)` plus an image suffix. The mosaic origin is the smallest row and column in the folder, stepped by tile size times `(1 − overlap_fraction)`. Current overlap is **0.1**. Files that do not match are still detected. They are omitted from the stitch and shown on their own PDF pages. Overlapping grid tiles that report the same particle are merged (8 px, about 29 µm at 3.61 µm/px). The highest-confidence hit keeps the position. Cluster size is the max of the members.
 
-The two profiles differ in a few gates. Everything else is shared.
+The two modes differ in a few gates, and in which model each beta uses. Everything else is shared.
 
-| | Uniform (`config/config.yaml`) | NSEW (`config/nsew_config.yaml`) |
-|--|-------------------------|---------------------------|
-| Model | v4 residual at 0.23 | v8 at 0.37 |
+| Beta | Uniform (`config/config.yaml`) | NSEW (`config/nsew_config.yaml`) |
+|------|--------------------------------|----------------------------------|
+| 0.5 | v7 at 0.60 | v4 residual at 0.51 |
+| 1.0 | v8 at 0.31 | v8 at 0.31 |
+| 1.5 | v8 at 0.31 | v4 residual at 0.34 |
+| 2.0 | v7 at 0.21 | v8 at 0.30 |
+
+| | Uniform | NSEW |
+|--|---------|------|
 | Border drop | 8 px | 12 px |
 | Cluster rule | drop at 3 neighbours within 48 px | drop at 2 |
 | Top-hat radius | 50 px | 25 px |
@@ -136,7 +142,7 @@ cd particle-detection
 streamlit run app.py
 ```
 
-Python 3.11 or newer. Setup is in [README.md](../README.md). The app uses port 8502. On a Mac you can also open **getting_started/Particle Detection.app**. On Windows, **getting_started/Start Particle Detection.bat**.
+64-bit Python 3.11 or newer. Setup is in [README.md](../README.md), including Printrun for the stage and the Windows camera and serial drivers. The app uses port 8502. On a Mac you can also open **getting_started/Particle Detection.app**. On Windows, **getting_started/Start Particle Detection.bat**. If the Windows launcher cannot find `.venv`, it leaves a message on screen and in `%LOCALAPPDATA%\ParticleDetection\launcher.log`.
 
 | Module | Use |
 |--------|-----|

@@ -1,5 +1,3 @@
-"""Load and apply the optional post-filter on detector proposals."""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -8,14 +6,10 @@ from typing import Any
 import numpy as np
 
 from src.overall.config import PACKAGE_ROOT, cfg_get
-from src.analyse.detection.detector import ParticleCandidate, compute_tile_residual
-from src.overall.io.tile_loader import DEFAULT_FILENAME_PATTERN
+from src.analyse.detection.detector import ParticleCandidate
 from src.analyse.ml.features import FEATURE_COLUMNS, candidates_to_matrix
-from src.analyse.ml.patch_features import layout_from_candidate, patches_to_matrix
-from src.analyse.ml.patches import PATCH_SIZE, extract_unmarked_channels
 
 KIND_RESIDUAL = "residual"
-KIND_PATCH = "patch"
 
 DEFAULT_MODEL_PATH = "src/analyse/models/particle_clf_v4_residual.joblib"
 
@@ -51,14 +45,18 @@ def load_artifact(path: str | Path) -> dict[str, Any]:
             f"{destination.name} is a cascade model (TinyCNN). "
             "Those models are no longer supported."
         )
-    if kind == KIND_RESIDUAL:
-        names = tuple(artifact.get("feature_names") or FEATURE_COLUMNS)
-        if names != FEATURE_COLUMNS:
-            raise ValueError(
-                f"Model feature names {names} do not match {FEATURE_COLUMNS}"
-            )
-    elif kind != KIND_PATCH:
+    if kind == "patch":
+        raise ValueError(
+            f"{destination.name} is a patch model (HOG). "
+            "Those models are no longer supported."
+        )
+    if kind != KIND_RESIDUAL:
         raise ValueError(f"Unknown ML artifact kind {kind!r}")
+    names = tuple(artifact.get("feature_names") or FEATURE_COLUMNS)
+    if names != FEATURE_COLUMNS:
+        raise ValueError(
+            f"Model feature names {names} do not match {FEATURE_COLUMNS}"
+        )
     artifact["kind"] = kind
     return artifact
 
@@ -84,7 +82,7 @@ def _positive_proba(model: Any, matrix: np.ndarray) -> np.ndarray:
 
 
 def calibrate_scores(artifact: dict[str, Any], scores: np.ndarray) -> np.ndarray:
-    """Map raw ExtraTrees P to isotonic probabilities when a calibrator exists."""
+    
     raw = np.asarray(scores, dtype=np.float64)
     calibrator = artifact.get("calibrator")
     if calibrator is None or raw.size == 0:
@@ -103,57 +101,11 @@ def predict_proba(
     return calibrate_scores(artifact, _positive_proba(artifact["model"], matrix))
 
 
-def _candidate_patches(
-    candidates: list[ParticleCandidate],
-    image: np.ndarray,
-    config: dict[str, Any],
-    patch_size: int,
-) -> np.ndarray:
-    _array, residual = compute_tile_residual(image, config)
-    corrected = np.asarray(image, dtype=np.float32)
-    patches = [
-        extract_unmarked_channels(
-            corrected, residual, float(cand.x_local), float(cand.y_local), size=patch_size
-        )
-        for cand in candidates
-    ]
-    return np.stack(patches, axis=0)
-
-
-def predict_patch_scores(
-    candidates: list[ParticleCandidate],
-    artifact: dict[str, Any],
-    config: dict[str, Any],
-    image: np.ndarray,
-    source_tile: str = "",
-) -> np.ndarray:
-    """HOG ExtraTrees scores on unmarked crops of the corrected tile."""
-    if not candidates:
-        return np.empty((0,), dtype=np.float64)
-    patch_size = int(artifact.get("patch_size") or PATCH_SIZE)
-    channels = _candidate_patches(candidates, image, config, patch_size)
-    pixel_size = float(cfg_get(config, "pixel_size_nm", 1.0))
-    pattern = str(cfg_get(config, "filename_pattern", DEFAULT_FILENAME_PATTERN))
-    layouts = [
-        layout_from_candidate(cand, pixel_size, source_tile, pattern)
-        for cand in candidates
-    ]
-    matrix = patches_to_matrix(channels, layouts)
-    return calibrate_scores(artifact, _positive_proba(artifact["model"], matrix))
-
-
 def apply_ml_filter(
     candidates: list[ParticleCandidate],
     config: dict[str, Any],
-    image: np.ndarray | None = None,
-    source_tile: str = "",
 ) -> list[ParticleCandidate]:
-    """Drop proposals whose P(particle) is below the configured threshold.
-
-    No-op when ``ml.enabled`` is false. Raises if enabled but the model file
-    is missing so a silent classical run cannot be mistaken for a filter.
-    Patch artifacts need the corrected tile ``image``.
-    """
+    
     if not bool(cfg_get(config, "ml.enabled", False)):
         return candidates
     path = resolve_model_path(cfg_get(config, "ml.model_path", DEFAULT_MODEL_PATH))
@@ -168,16 +120,5 @@ def apply_ml_filter(
         threshold = artifact.get("threshold", 0.35)
     threshold = float(threshold)
     pixel_size = float(cfg_get(config, "pixel_size_nm", 1.0))
-    kind = str(artifact.get("kind") or KIND_RESIDUAL)
-    if kind == KIND_PATCH:
-        if image is None:
-            raise ValueError(
-                "Patch ML filter needs the corrected tile image. "
-                "Pass image= from the pipeline worker."
-            )
-        scores = predict_patch_scores(
-            candidates, artifact, config, image, source_tile=source_tile
-        )
-    else:
-        scores = predict_proba(candidates, artifact, pixel_size)
+    scores = predict_proba(candidates, artifact, pixel_size)
     return [cand for cand, score in zip(candidates, scores) if score >= threshold]

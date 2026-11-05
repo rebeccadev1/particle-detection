@@ -1,19 +1,8 @@
-"""Serpentine stage scan, sent to the printer the same way Pronterface does.
-
-Millimetres, relative moves, a pause at the current point, then a step. Rows
-alternate +X and -X. Between rows the stage steps in -Y. The scan starts from
-the current position. A finished scan steps back to that start, stop (1, 1).
-Home is separate: it parks X and Y on the Ender-3 V3 SE endstops and
-leaves Z where it is.
-
-The standard grid covers a 60 by 40 mm area. Each picture sees 7.40 mm.
-The pictures overlap by 10%, so the stage steps 6.66 mm between centers.
-"""
-
 from __future__ import annotations
 
 import builtins
 import math
+import os
 import sys
 import time
 import warnings
@@ -28,11 +17,7 @@ from src.capture.camera_automation import (
 )
 
 def _load_printer_link() -> dict:
-    """Keep the open printer across a script reload.
-
-    A reload otherwise forgets the connection and the port stays open in the
-    old thread. The next connect opens it again, and macOS then returns no data.
-    """
+    
     shared = getattr(builtins, "_asml_printer_link", None)
     if isinstance(shared, dict) and "core" in shared:
         return shared
@@ -56,11 +41,7 @@ PAUSE_MARGIN_MS = 500
 
 
 def step_from_fov(fov_mm: float, overlap: float = OVERLAP) -> float:
-    """Distance between picture centers, in millimetres.
-
-    ``overlap`` is the fraction of the field shared with the next picture.
-    The printer is sent two decimal places, so the result is rounded to that.
-    """
+    
     fov_mm = float(fov_mm)
     overlap = float(overlap)
     if fov_mm <= 0:
@@ -77,11 +58,7 @@ DEFAULT_STEP_MM = step_from_fov(FOV_MM, OVERLAP)
 
 
 def grid_stops(span_mm: float, fov_mm: float = FOV_MM, step_mm: float = DEFAULT_STEP_MM) -> int:
-    """Stops needed so the pictures cover ``span_mm``.
-
-    The first stop already covers one field of view. Each further stop advances
-    by ``step_mm``.
-    """
+    
     span_mm = float(span_mm)
     fov_mm = float(fov_mm)
     step_mm = float(step_mm)
@@ -105,7 +82,7 @@ def _num(value: float) -> str:
 
 
 def _mm(value: float) -> str:
-    """A distance the printer moves, always with two digits after the decimal."""
+    
     return f"{round(float(value), 2):.2f}"
 
 
@@ -116,11 +93,7 @@ def build_scan_gcode(
     feed: float = DEFAULT_FEED,
     dwell_ms: float = DEFAULT_DWELL_MS,
 ) -> str:
-    """G-code for one serpentine scan. Defaults cover 60 by 40 mm at the default step.
-
-    ``columns`` and ``rows`` are the number of stops. The stage makes one
-    fewer move than that along each axis. Distances are sent with two decimal places.
-    """
+    
     step_mm = round(float(step_mm), 2)
     columns = int(columns)
     rows = int(rows)
@@ -163,13 +136,7 @@ def build_scan_gcode(
 
 
 def pause_plan(total_exposure_ms: float, mode: str) -> dict:
-    """How long the stage holds still so the pictures at one stop can finish.
-
-    Uniform takes one frame. NSEW takes four frames, and each shutter is the
-    total exposure. Every frame also waits for the lights to settle, plus a
-    fixed margin. Automatic NSEW waits ``NSEW_GAP_S`` between sides. Each stop
-    also waits ``MOTION_PAUSE_S`` after the move.
-    """
+    
     uniform = mode != "NSEW"
     frames = 1 if uniform else RING_SIDES
     gaps = 0 if uniform else frames - 1
@@ -192,12 +159,7 @@ def pause_plan(total_exposure_ms: float, mode: str) -> dict:
 
 
 def build_relative_move_gcode(axis: str, delta_mm: float, feed: float) -> str:
-    """One relative step, then wait until the printer has finished moving.
-
-    ``G91`` steps from the current position. ``M400`` is the handshake that the
-    move is done. ``G90`` puts the printer back in the absolute mode a scan
-    leaves behind.
-    """
+    
     axis = str(axis).upper()
     if axis not in {"X", "Y", "Z"}:
         raise ValueError("axis must be X, Y, or Z")
@@ -219,10 +181,7 @@ def build_relative_move_gcode(axis: str, delta_mm: float, feed: float) -> str:
     )
 
 
-def move_axis(axis: str, delta_mm: float, feed: float) -> None:
-    """Step one axis and block until that short program has finished."""
-    text = build_relative_move_gcode(axis, delta_mm, feed)
-    axis = str(axis).upper()
+def _require_printer_ready() -> None:
     status = printer_status()
     if not status["connected"]:
         raise RuntimeError("Connect the printer first.")
@@ -230,8 +189,9 @@ def move_axis(axis: str, delta_mm: float, feed: float) -> None:
         raise RuntimeError("The printer has not answered yet. Wait a moment and try again.")
     if status["printing"]:
         raise RuntimeError("A scan is already running.")
-    start_gcode(text)
-    timeout_s = abs(float(delta_mm)) / float(feed) * 60.0 + 5.0
+
+
+def _wait_until_idle(timeout_s: float, failure: str) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         info = printer_status()
@@ -241,20 +201,25 @@ def move_axis(axis: str, delta_mm: float, feed: float) -> None:
             return
         time.sleep(0.05)
     stop_scan()
-    raise TimeoutError(f"The {axis} move did not finish.")
+    raise TimeoutError(failure)
+
+
+def move_axis(axis: str, delta_mm: float, feed: float) -> None:
+    text = build_relative_move_gcode(axis, delta_mm, feed)
+    axis = str(axis).upper()
+    _require_printer_ready()
+    start_gcode(text)
+    timeout_s = abs(float(delta_mm)) / float(feed) * 60.0 + 5.0
+    _wait_until_idle(timeout_s, f"The {axis} move did not finish.")
 
 
 def move_z(delta_mm: float, feed: float) -> None:
-    """Step Z and block until that short program has finished."""
+    
     move_axis("Z", delta_mm, feed)
 
 
 def return_from_stop_moves(row: int, col: int, step_mm: float) -> list[tuple[str, float]]:
-    """Relative X and Y from this serpentine stop back to (1, 1).
-
-    Column 1 is the X where the scan started, on every row. Row 1 is the Y
-    where it started. Z is left where focus put it.
-    """
+    
     row = int(row)
     col = int(col)
     step_mm = float(step_mm)
@@ -271,12 +236,7 @@ def return_from_stop_moves(row: int, col: int, step_mm: float) -> list[tuple[str
 
 
 def return_to_start_moves(columns: int, rows: int, step_mm: float) -> list[tuple[str, float]]:
-    """Relative X and Y that land back on stop (1, 1) after a full serpentine.
-
-    Odd rows finish on the last column, so X steps back across the row. Even
-    rows already finish on column 1. Y always walks back toward the first row.
-    Z is left where focus put it.
-    """
+    
     columns = int(columns)
     rows = int(rows)
     step_mm = float(step_mm)
@@ -289,11 +249,7 @@ def return_to_start_moves(columns: int, rows: int, step_mm: float) -> list[tuple
 
 
 def build_home_gcode() -> str:
-    """Park X and Y on the Ender-3 V3 SE endstops. Z is not homed.
-
-    ``G28 X Y`` is the firmware home. On the stock machine that position is
-    X −13 mm and Y −15 mm, so nothing else has to be commanded.
-    """
+    
     return "\n".join(
         [
             "G21",
@@ -305,36 +261,14 @@ def build_home_gcode() -> str:
 
 
 def home_xy() -> None:
-    """Home X and Y, then block until the stage is on the endstops."""
     text = build_home_gcode()
-    status = printer_status()
-    if not status["connected"]:
-        raise RuntimeError("Connect the printer first.")
-    if not status["online"]:
-        raise RuntimeError("The printer has not answered yet. Wait a moment and try again.")
-    if status["printing"]:
-        raise RuntimeError("A scan is already running.")
+    _require_printer_ready()
     start_gcode(text)
-    deadline = time.monotonic() + 90.0
-    while time.monotonic() < deadline:
-        info = printer_status()
-        if not info["printing"]:
-            if not info["connected"]:
-                raise RuntimeError(info["error"] or "The printer disconnected.")
-            return
-        time.sleep(0.05)
-    stop_scan()
-    raise TimeoutError("Homing did not finish.")
+    _wait_until_idle(90.0, "Homing did not finish.")
 
 
 def scan_stops(columns: int, rows: int, step_mm: float) -> list[tuple[int, int, str | None, float]]:
-    """Visit order for one serpentine, starting at the current position.
-
-    Each item is ``(row, col, axis, delta_mm)``. Row and column are 1-based
-    grid positions, with column 1 on the side where the scan starts. The first
-    stop is already under the camera, so its axis is ``None``. Later stops
-    step +X along odd rows, -X along even rows, and -Y to the next row.
-    """
+    
     columns = int(columns)
     rows = int(rows)
     step_mm = float(step_mm)
@@ -361,7 +295,7 @@ def scan_stops(columns: int, rows: int, step_mm: float) -> list[tuple[int, int, 
 
 
 def scan_summary(step_mm: float, columns: int, rows: int, fov_mm: float = FOV_MM) -> dict:
-    """Stop count and the photographed area for the controls."""
+    
     step_mm = float(step_mm)
     columns = int(columns)
     rows = int(rows)
@@ -377,16 +311,42 @@ def scan_summary(step_mm: float, columns: int, rows: int, fov_mm: float = FOV_MM
     }
 
 
+def _pipx_printrun_roots() -> list[Path]:
+    
+    home = Path.home()
+    roots = [
+        home / "Library/Application Support/pipx/venvs/printrun",
+        home / ".local/pipx/venvs/printrun",
+        home / ".local/share/pipx/venvs/printrun",
+        home / "pipx/venvs/printrun",
+    ]
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        roots.append(Path(local) / "pipx/venvs/printrun")
+    pipx_home = os.environ.get("PIPX_HOME")
+    if pipx_home:
+        roots.append(Path(pipx_home) / "venvs/printrun")
+    return roots
+
+
 def _pipx_printrun_site() -> Path | None:
-    root = Path.home() / "Library/Application Support/pipx/venvs/printrun/lib"
-    found = sorted(root.glob("python*/site-packages/printrun/printcore.py"))
+    
+    patterns = (
+        "lib/python*/site-packages/printrun/printcore.py",
+        "Lib/site-packages/printrun/printcore.py",
+        "lib/site-packages/printrun/printcore.py",
+    )
+    found: list[Path] = []
+    for root in _pipx_printrun_roots():
+        for pattern in patterns:
+            found.extend(root.glob(pattern))
     if not found:
         return None
-    return found[-1].parents[1]
+    return sorted(found)[-1].parents[1]
 
 
 def load_printcore():
-    """printcore from this environment, or from the pipx Pronterface install."""
+    
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", SyntaxWarning)
         try:
@@ -396,8 +356,9 @@ def load_printcore():
             site = _pipx_printrun_site()
             if site is None:
                 raise ImportError(
-                    "Printrun is not available. Install it in the project "
-                    "environment with: .venv/bin/pip install Printrun"
+                    "Printrun is not available. With the virtual environment "
+                    "active, run: python -m pip install --no-deps "
+                    "\"Printrun==2.2.0\""
                 ) from None
             site_text = str(site)
             if site_text not in sys.path:
@@ -418,7 +379,7 @@ def _remember_errors(core) -> None:
 
 
 def connect_printer(port: str, baud: int = DEFAULT_BAUD):
-    """Open the printer port. Returns once the port is open, before the firmware answers."""
+    
     printcore, _gcode = load_printcore()
     disconnect_printer()
     _LINK["error"] = ""
@@ -497,7 +458,7 @@ def start_gcode(text: str) -> None:
 
 
 def stop_scan() -> None:
-    """Drop the rest of the queue. The move already in progress still finishes."""
+    
     core = _LINK.get("core")
     if core is None:
         return

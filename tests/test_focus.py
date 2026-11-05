@@ -1,5 +1,3 @@
-"""Autofocus hill climb. No printer and no camera."""
-
 import math
 
 import cv2

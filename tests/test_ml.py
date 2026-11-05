@@ -1,5 +1,3 @@
-"""Tests for the optional sklearn post-filter. Does not use circled crop JPEGs."""
-
 from __future__ import annotations
 
 from pathlib import Path

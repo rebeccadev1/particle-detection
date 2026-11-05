@@ -1,5 +1,3 @@
-"""Synthetic structured-surface tiles with known particle positions."""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -14,7 +12,7 @@ def make_structured_tile(
     lattice_sigma: float = 1.1,
     particles: list[tuple[float, float, float]] | None = None,
 ) -> np.ndarray:
-    """Return a float image: periodic lattice plus optional blobs ``(y, x, sigma)``."""
+    
     height, width = shape
     yy, xx = np.mgrid[0:height, 0:width]
     image = np.zeros(shape, dtype=np.float64)
@@ -34,11 +32,7 @@ def make_two_region_tile(
     dark: float = 0.2,
     particle: tuple[float, float, float] = (64.0, 48.0, 4.0),
 ) -> np.ndarray:
-    """Bright pad | dark pad with one compact blob in the dark field.
-
-    ``particle`` is ``(y, x, sigma)``. The blob is placed left of ``step_x``.
-    There is no lattice — this isolates region-border false positives.
-    """
+    
     height, width = shape
     image = np.full(shape, float(dark), dtype=np.float64)
     image[:, int(step_x) :] = float(bright)
@@ -55,11 +49,7 @@ def make_pad_tile(
     dark: float = 0.15,
     particle: tuple[float, float, float] | None = None,
 ) -> np.ndarray:
-    """Bright rectangular pad on a dark field, optional compact blob.
-
-    ``pad`` is ``(y0, x0, y1, x1)``. Top-hat leaves compact residual at the
-    pad *corners*; those must not be reported as particles.
-    """
+    
     height, width = shape
     image = np.full(shape, float(dark), dtype=np.float64)
     y0, x0, y1, x1 = pad
@@ -78,10 +68,7 @@ def make_dark_field_flake(
     dark: float = 0.12,
     bright: float = 0.95,
 ) -> np.ndarray:
-    """Dark field with one soft elliptical flake ``(semi-axis y, semi-axis x)``.
-
-    Default axes ≈ 70×65 px, a large contaminant on a blank pad.
-    """
+    
     height, width = shape
     image = np.full(shape, float(dark), dtype=np.float64)
     yy, xx = np.mgrid[0:height, 0:width]
@@ -103,11 +90,7 @@ def make_flake_on_step(
     dark: float = 0.15,
     flake: float = 0.95,
 ) -> np.ndarray:
-    """Vertical region step with one elliptical flake sitting on the step.
-
-    ``center`` is ``(y, x)``; place it on ``step_x`` and away from the tile
-    border so it is a single-edge hit, not an L-junction pad corner.
-    """
+    
     height, width = shape
     image = np.full(shape, float(dark), dtype=np.float64)
     image[:, int(step_x) :] = float(bright)
@@ -122,7 +105,7 @@ def make_flake_on_step(
 
 
 def write_tile_tiff(path: Path, image: np.ndarray) -> Path:
-    """Write a 32-bit TIFF suitable for ``tifffile.imread``."""
+    
     path.parent.mkdir(parents=True, exist_ok=True)
     scaled = np.clip(image / max(float(image.max()), 1e-6) * 65535.0, 0, 65535).astype(
         np.uint16
@@ -132,7 +115,7 @@ def write_tile_tiff(path: Path, image: np.ndarray) -> Path:
 
 
 def detector_test_config(**overrides: object) -> dict:
-    """Config tuned for small synthetic tiles (pixel_size_nm = 1)."""
+    
     config: dict = {
         "pixel_size_nm": 1.0,
         "overlap_fraction": 0.25,
@@ -155,9 +138,7 @@ def detector_test_config(**overrides: object) -> dict:
             "max_size_nm": 40.0,
             "blob_min_sigma": 1.5,
             "blob_max_sigma": 6.0,
-            "blob_num_sigma": 5,
             "blob_sigma_ratio": 1.4,
-            "blob_method": "dog",
             "blob_threshold": 0.05,
             "min_area_px": 8,
             "fft_mask": "per_tile",
@@ -174,7 +155,7 @@ def detector_test_config(**overrides: object) -> dict:
             "max_support_area_px": 0.0,
         },
         "measurement": {"merge_radius_px": 6.0, "size_aggregation": "max"},
-        "report": {"downsample": 2, "target_mb": 20.0},
+        "report": {"target_mb": 20.0},
         "pipeline": {"workers": 1},
     }
     for key, value in overrides.items():

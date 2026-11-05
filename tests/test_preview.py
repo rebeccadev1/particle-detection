@@ -1,5 +1,3 @@
-"""Live-view frames shown on the Capture tab."""
-
 import numpy as np
 
 from src.capture.preview import display_frame

@@ -1,5 +1,3 @@
-"""Write detected-particle tables to CSV, JSON, or Excel."""
-
 from __future__ import annotations
 
 import json
@@ -23,7 +21,7 @@ NM_PER_UM = 1000.0
 
 
 def result_table(df: pd.DataFrame) -> pd.DataFrame:
-    """id, global x/y in µm, size in µm, source tile, and confidence."""
+    
     if df.empty and "id" not in df.columns:
         return pd.DataFrame(columns=list(EXPORT_COLUMNS))
     frame = df.copy()
@@ -46,7 +44,7 @@ def result_table(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def write_csv(df: pd.DataFrame, path: str | Path) -> Path:
-    """Write the result table as CSV."""
+    
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     result_table(df).to_csv(destination, index=False)
@@ -54,8 +52,15 @@ def write_csv(df: pd.DataFrame, path: str | Path) -> Path:
 
 
 def parameters_payload(config: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Nested settings used for this run."""
-    return _json_ready(dict(config) if config else {})
+    
+    from src.overall.config import apply_beta_ml
+
+    payload = _json_ready(dict(config) if config else {})
+    apply_beta_ml(payload)
+    report = payload.get("report")
+    if isinstance(report, dict):
+        report.pop("beta_presets", None)
+    return payload
 
 
 def write_run_settings(
@@ -63,7 +68,7 @@ def write_run_settings(
     path: str | Path,
     csv_path: str | Path | None = None,
 ) -> Path:
-    """Write this run's settings into the output folder as ``last_pipeline.json``."""
+    
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     payload = parameters_payload(config)
@@ -80,7 +85,7 @@ def write_run_settings(
 
 
 def parameters_table(config: Mapping[str, Any] | None) -> pd.DataFrame:
-    """Flatten nested run settings into ``parameter`` / ``value`` rows."""
+    
     rows: list[dict[str, Any]] = []
     if config:
         _flatten_config(dict(config), "", rows)
@@ -92,11 +97,7 @@ def write_xlsx(
     path: str | Path,
     config: Mapping[str, Any] | None = None,
 ) -> Path:
-    """Write particles on sheet 1 and this run's settings on sheet 2.
-
-    Sheet 2 includes preprocessing and detection (and the rest of the config
-    that was passed in, such as pixel size and ML).
-    """
+    
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     _write_workbook(destination, result_table(df), parameters_table(config))
@@ -107,7 +108,7 @@ def excel_bytes(
     df: pd.DataFrame,
     config: Mapping[str, Any] | None = None,
 ) -> bytes:
-    """In-memory workbook with the same two sheets as ``write_xlsx``."""
+    
     buffer = BytesIO()
     _write_workbook(buffer, result_table(df), parameters_table(config))
     return buffer.getvalue()

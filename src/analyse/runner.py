@@ -1,5 +1,3 @@
-"""Orchestrate per-tile load → preprocess → detect → measure. Accumulate rows only."""
-
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -13,7 +11,12 @@ import cv2
 import numpy as np
 import pandas as pd
 
-from src.overall.config import cfg_get, resolve_output_dir
+from src.overall.config import (
+    apply_beta_ml,
+    cfg_get,
+    reserve_fresh_output_dir,
+    resolve_output_dir,
+)
 from src.analyse.detection.detector import (
     apply_structure_filters,
     build_fft_notch_mask,
@@ -61,7 +64,7 @@ StopCheck = Callable[[], bool]
 
 
 class PipelineStopped(Exception):
-    """Raised when a run is asked to stop before the next tile."""
+    pass
 
 _WORKER_STATE: dict[str, Any] = {
     "fft_mask": None,
@@ -71,7 +74,7 @@ _WORKER_STATE: dict[str, Any] = {
 
 @dataclass(frozen=True)
 class _TileWorkResult:
-    """Lightweight per-tile output returned from a thread worker."""
+    
 
     particles: list[Particle]
     placement: TilePlacement | None
@@ -115,8 +118,23 @@ def _tile_is_placeable(tile: Tile) -> bool:
     return tile.row is not None and tile.col is not None
 
 
+def _placements_for_paths(
+    paths: list[Path],
+    pattern: str,
+    overlap: float,
+    row_origin: int,
+    col_origin: int,
+) -> list[TilePlacement]:
+    return [
+        placement
+        for path in paths
+        if (placement := placement_from_path(path, pattern, overlap, row_origin, col_origin))
+        is not None
+    ]
+
+
 def load_report_mosaic(config: dict[str, Any]) -> LazyMosaic:
-    """Tile placements for the stitched report, without running detection."""
+    
     folder = cfg_get(config, "input_dir", "")
     if not folder:
         return LazyMosaic([])
@@ -129,17 +147,11 @@ def load_report_mosaic(config: dict[str, Any]) -> LazyMosaic:
     )
     paths = prepare_detection_paths(paths)
     row_origin, col_origin = grid_index_origin(paths, pattern)
-    placements = [
-        placement
-        for path in paths
-        if (placement := placement_from_path(path, pattern, overlap, row_origin, col_origin))
-        is not None
-    ]
-    return LazyMosaic(placements)
+    return LazyMosaic(_placements_for_paths(paths, pattern, overlap, row_origin, col_origin))
 
 
 def _prepare_fft_mask(paths: list[Path], config: dict[str, Any]) -> np.ndarray | None:
-    """Shared lattice mask from the first tile, or None for per-tile notches."""
+    
     if str(cfg_get(config, "detection.method", "fft")).lower() != "fft":
         return None
     mode = str(cfg_get(config, "detection.fft_mask", "per_tile")).lower()
@@ -154,9 +166,6 @@ def _prepare_fft_mask(paths: list[Path], config: dict[str, Any]) -> np.ndarray |
 
 
 def _thumbnail_factor(placements: list[TilePlacement], config: dict[str, Any]) -> int:
-    configured = int(cfg_get(config, "report.downsample", 0) or 0)
-    if configured > 0:
-        return configured
     height, width = mosaic_shape(placements)
     return downsample_for_target(
         height,
@@ -175,7 +184,7 @@ def _process_tile(
     row_origin: int = 0,
     col_origin: int = 0,
 ) -> _TileWorkResult:
-    """Load and process one tile. Top-level so ThreadPoolExecutor can call it."""
+    
     tile = _tile_from_path(Path(path_str), pattern)
     if _tile_is_placeable(tile):
         placement = placement_from_tile(tile, overlap, row_origin, col_origin)
@@ -212,9 +221,7 @@ def _process_tile(
         if is_combi_tile(tile.path.name)
         else lighting_source_name(tile.path)
     )
-    candidates = apply_ml_filter(
-        candidates, config, image=corrected, source_tile=source_name
-    )
+    candidates = apply_ml_filter(candidates, config)
     if score_before_structure:
         candidates = apply_structure_filters(candidates, config)
     particles = measure_candidates(
@@ -277,19 +284,13 @@ def _combine_particle_tables(
         else:
             frames.append(measure_and_dedupe(particles, config))
     fraction = float(cfg_get(config, "measurement.nsew_size_match_fraction", 0.4))
-    for particles in lighting.values():
+    groups = list(lighting.values())
+    if directional:
+        groups.append(directional)
+    for particles in groups:
         frames.append(
             measure_and_dedupe(
                 particles,
-                config,
-                size_match_fraction=fraction,
-                directional=True,
-            )
-        )
-    if directional:
-        frames.append(
-            measure_and_dedupe(
-                directional,
                 config,
                 size_match_fraction=fraction,
                 directional=True,
@@ -315,25 +316,8 @@ def run_pipeline(
     write_outputs: bool = True,
     should_stop: StopCheck | None = None,
 ) -> tuple[pd.DataFrame, LazyMosaic]:
-    """Run detection on each tile without retaining full-resolution images.
-
-    Returns the de-duplicated particle table and a lazy mosaic for reporting.
-    Mosaic thumbnails are generated during the detection pass when the overlay
-    downsample factor is greater than 1.
-
-    When ``write_outputs`` is true and ``output_dir`` is set, writes
-    ``particles.csv``, ``particles.xlsx``, ``last_pipeline.json`` (every setting
-    used for this run, in that output folder), ``mosaic_overlay.png`` and
-    ``mosaic_plain.png`` when tiles were stitched, and ``Summary of {input folder}.pdf``
-    (counts, size histogram, the mosaic with labels above the mosaic without them,
-    and any images whose filenames have no grid pattern, each shown with and
-    without labels).
-    The workbook's second sheet is the same settings as the JSON file. The
-    particle table keeps id, global x/y in µm, size in µm, source tile, and confidence.
-
-    ``should_stop`` is checked between tiles. When it returns true the run
-    raises ``PipelineStopped`` and does not write outputs.
-    """
+    
+    apply_beta_ml(config)
     folder = cfg_get(config, "input_dir", "")
     if not folder:
         raise ValueError("config.input_dir is required.")
@@ -373,12 +357,7 @@ def run_pipeline(
 
     workers = _worker_count(config, total)
     row_origin, col_origin = grid_index_origin(paths, pattern)
-    placements_plan = [
-        placement
-        for path in paths
-        if (placement := placement_from_path(path, pattern, overlap, row_origin, col_origin))
-        is not None
-    ]
+    placements_plan = _placements_for_paths(paths, pattern, overlap, row_origin, col_origin)
     thumb_factor = _thumbnail_factor(placements_plan, config) if placements_plan else 0
     fft_mask = _prepare_fft_mask(paths, config)
     _set_worker_state(fft_mask, thumb_factor)
@@ -460,7 +439,7 @@ def _write_run_outputs(
     mosaic: LazyMosaic,
     config: dict[str, Any],
 ) -> None:
-    """Save the particle table, the settings that produced it, and the report."""
+    
     if not str(cfg_get(config, "output_dir", "") or "").strip():
         return
     from src.overall.io.results_writer import write_csv, write_run_settings, write_xlsx
@@ -473,8 +452,8 @@ def _write_run_outputs(
         write_last_run_pdf,
     )
 
-    out = resolve_output_dir(cfg_get(config, "output_dir"))
-    csv_path, _json_path, xlsx_path = default_output_paths(config)
+    out = reserve_fresh_output_dir(config)
+    csv_path, xlsx_path = default_output_paths(config)
     write_csv(table, csv_path)
     write_xlsx(table, xlsx_path, config)
     write_run_settings(config, out / "last_pipeline.json", csv_path=csv_path)
@@ -523,7 +502,6 @@ def _write_overlay_png(rgb: np.ndarray, path: Path) -> None:
         raise RuntimeError(f"Failed to write mosaic image to {path}")
 
 
-def default_output_paths(config: dict[str, Any]) -> tuple[Path, Path, Path]:
-    """CSV, JSON, and Excel destinations under ``output_dir``."""
+def default_output_paths(config: dict[str, Any]) -> tuple[Path, Path]:
     out = resolve_output_dir(cfg_get(config, "output_dir"))
-    return out / "particles.csv", out / "particles.json", out / "particles.xlsx"
+    return out / "particles.csv", out / "particles.xlsx"

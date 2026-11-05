@@ -1,5 +1,3 @@
-"""When scan and capture refocuses, and the sharpness floor."""
-
 import json
 
 import cv2
@@ -19,14 +17,14 @@ from src.capture.scan_capture import (
 from src.capture.stage import scan_stops
 
 
-def test_refocus_lands_on_every_seventh_step() -> None:
-    assert FOCUS_EVERY_STEPS == 7
-    assert [step for step in range(0, 22) if refocus_due(step)] == [7, 14, 21]
-    assert [step for step in range(0, 22) if refocus_due(step, enabled=False)] == []
+def test_refocus_lands_on_every_fifth_step() -> None:
+    assert FOCUS_EVERY_STEPS == 5
+    assert [step for step in range(0, 16) if refocus_due(step)] == [5, 10, 15]
+    assert [step for step in range(0, 16) if refocus_due(step, enabled=False)] == []
 
 
-def test_serpentine_refocuses_after_seven_moves() -> None:
-    stops = scan_stops(8, 1, 1.0)
+def test_serpentine_refocuses_after_five_moves() -> None:
+    stops = scan_stops(12, 1, 1.0)
     taken = 0
     focused = []
     for _row, _col, axis, _delta in stops:
@@ -35,7 +33,7 @@ def test_serpentine_refocuses_after_seven_moves() -> None:
         taken += 1
         if refocus_due(taken):
             focused.append(taken)
-    assert focused == [7]
+    assert focused == [5, 10]
 
 
 def test_sharpness_log_keeps_each_stop_and_the_autofocus_move(tmp_path) -> None:

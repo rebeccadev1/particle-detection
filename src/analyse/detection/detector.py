@@ -1,5 +1,3 @@
-"""Per-tile particle candidate detection with structured-background suppression."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
@@ -9,7 +7,6 @@ import cv2
 import numpy as np
 from scipy import fft as sp_fft
 from scipy.spatial import cKDTree
-from skimage.feature import blob_log
 from skimage.morphology import skeletonize
 
 from src.overall.config import cfg_get
@@ -23,6 +20,7 @@ _STRUCTURE_SIZE_RATIO = 1.30
 _STRUCTURE_LINE_MAX_GAP_PX = 48.0
 _STRUCTURE_SNR_RATIO = 2.5
 _AUTO_SNR_SIGMA_FACTOR = 3.5
+_BLOB_DIAMETER_PER_SIGMA = 2.0 * float(np.sqrt(2.0))
 _PERCENTILE_EXACT_LIMIT = 50_000
 _HIST_BINS = 512
 _MEDIAN_SAMPLE = 250_000
@@ -52,7 +50,7 @@ NEIGHBOR_FEATURE_PX = 48.0
 
 @dataclass(frozen=True)
 class ParticleCandidate:
-    """A detection in local (tile) pixel coordinates, origin at top-left."""
+    
 
     y_local: float
     x_local: float
@@ -74,7 +72,7 @@ def _notch_mask_from_spectrum(
     peak_threshold: float,
     notch_radius: int,
 ) -> np.ndarray:
-    """Boolean notch mask in unshifted ``rfft2`` layout, DC neighborhood protected."""
+    
     magnitude = np.abs(spectrum)
     peak = float(np.max(magnitude))
     height, nfreq = magnitude.shape
@@ -108,7 +106,7 @@ def build_fft_notch_mask(
     peak_threshold: float,
     notch_radius: int,
 ) -> np.ndarray:
-    """Lattice notch mask from one representative tile (``rfft2`` layout)."""
+    
     array = np.ascontiguousarray(image, dtype=_FLOAT)
     spectrum = sp_fft.rfft2(array, workers=1)
     return _notch_mask_from_spectrum(spectrum, peak_threshold, notch_radius)
@@ -120,11 +118,7 @@ def suppress_periodic_fft(
     notch_radius: int,
     mask: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Notch-filter dominant lattice peaks in the FFT, leaving DC intact.
-
-    If ``mask`` matches this tile's ``rfft2`` shape it is reused; otherwise peaks
-    are detected on this tile's spectrum. An empty mask skips the transform.
-    """
+    
     array = np.ascontiguousarray(image, dtype=_FLOAT)
     if mask is not None and mask.shape[0] == array.shape[0] and not mask.any():
         return array
@@ -138,11 +132,7 @@ def suppress_periodic_fft(
 
 
 def suppress_periodic_tophat(image: np.ndarray, radius: int) -> np.ndarray:
-    """Morphological white top-hat: keep bright objects smaller than ``radius``.
-
-    Uses OpenCV's elliptical kernel. skimage's ``white_tophat`` with ``disk(r)``
-    is equivalent in shape but much slower on large tiles (seconds vs tens of ms).
-    """
+    
     r = max(int(radius), 1)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
     array = np.ascontiguousarray(image, dtype=_FLOAT)
@@ -150,7 +140,7 @@ def suppress_periodic_tophat(image: np.ndarray, radius: int) -> np.ndarray:
 
 
 def _gaussian_blur(image: np.ndarray, sigma: float) -> np.ndarray:
-    """Separable Gaussian blur. Large ``sigma`` is applied at reduced resolution."""
+    
     array = np.ascontiguousarray(image, dtype=_FLOAT)
     if sigma <= 0:
         return array
@@ -175,17 +165,11 @@ def _gaussian_blur(image: np.ndarray, sigma: float) -> np.ndarray:
             borderType=cv2.BORDER_REFLECT_101,
         )
         return cv2.resize(blurred, (width, height), interpolation=cv2.INTER_LINEAR)
-    return cv2.GaussianBlur(
-        array,
-        ksize=(0, 0),
-        sigmaX=float(sigma),
-        sigmaY=float(sigma),
-        borderType=cv2.BORDER_REFLECT_101,
-    )
+    return _gaussian_blur_full(array, sigma)
 
 
 def _gaussian_blur_full(image: np.ndarray, sigma: float) -> np.ndarray:
-    """Full-resolution Gaussian. Used by DoG so blob scales match scikit-image."""
+    
     array = np.ascontiguousarray(image, dtype=_FLOAT)
     if sigma <= 0:
         return array
@@ -199,7 +183,7 @@ def _gaussian_blur_full(image: np.ndarray, sigma: float) -> np.ndarray:
 
 
 def _subsample_for_stats(values: np.ndarray, limit: int = _MEDIAN_SAMPLE) -> np.ndarray:
-    """Systematic subsample so median / MAD stay O(limit) on multi-megapixel tiles."""
+    
     array = np.asarray(values).reshape(-1)
     if array.size <= limit:
         return array
@@ -208,7 +192,7 @@ def _subsample_for_stats(values: np.ndarray, limit: int = _MEDIAN_SAMPLE) -> np.
 
 
 def _mad_floor(values: np.ndarray) -> float:
-    """Robust noise floor: median absolute deviation, scaled like a std-dev."""
+    
     array = np.asarray(_subsample_for_stats(values), dtype=np.float64)
     if array.size == 0:
         return 1e-6
@@ -218,7 +202,7 @@ def _mad_floor(values: np.ndarray) -> float:
 
 
 def _approx_percentile(image: np.ndarray, q: float) -> float:
-    """Percentile via a histogram for large tiles; exact sort for small ones."""
+    
     array = np.asarray(image, dtype=_FLOAT)
     if array.size == 0:
         return 0.0
@@ -240,7 +224,7 @@ def _approx_percentile(image: np.ndarray, q: float) -> float:
 
 
 def _scale_unit(image: np.ndarray) -> np.ndarray:
-    """Shift to non-negative and scale a robust high percentile into ``[0, 1]``."""
+    
     array = np.ascontiguousarray(image, dtype=_FLOAT)
     array = array - _FLOAT(float(np.min(array)))
     hi = float(_approx_percentile(array, _SNR_PERCENTILE))
@@ -253,12 +237,7 @@ def _scale_unit(image: np.ndarray) -> np.ndarray:
 
 
 def local_snr(residual: np.ndarray, sigma: float) -> np.ndarray:
-    """Divide residual by a slow envelope of local energy.
-
-    Isolated blobs in a smooth field are boosted. Long edges and busy texture
-    have high local energy and are suppressed. ``sigma`` should be several times
-    the particle scale. ``sigma <= 0`` skips this and only does unit scaling.
-    """
+    
     array = np.ascontiguousarray(residual, dtype=_FLOAT)
     array = array - _FLOAT(float(np.min(array)))
     if sigma <= 0:
@@ -271,7 +250,7 @@ def local_snr(residual: np.ndarray, sigma: float) -> np.ndarray:
 
 
 def _keep_long_edges(mask: np.ndarray, length: int) -> np.ndarray:
-    """Keep connected components that are elongated or thinly filled and long enough."""
+    
     if length <= 0 or not np.any(mask):
         return mask
     _nlab, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, 8)
@@ -295,17 +274,7 @@ def coarse_edge_distance(
     sigma: float,
     min_length: float = 40.0,
 ) -> np.ndarray:
-    """Distance (px) to the nearest *long* coarse region border of ``image``.
-
-    Gradient is taken after a heavy blur so lattice/texture is ignored.
-    Hysteresis keeps weaker box borders that connect to stronger corners;
-    morphological close rejoins broken segments. Compact particle halos are
-    dropped (need an elongated or thin component at least ``min_length`` px).
-    The mask is then skeletonized so distance is to the border *line*, not a
-    fat gradient band (which would swallow real specks sitting inside a pad).
-    The tile frame is included so truncated pads at the crop edge are not
-    treated as particles. ``sigma <= 0`` returns a large constant.
-    """
+    
     height, width = np.asarray(image).shape[:2]
     far = _FLOAT(float(max(height, width, 1)))
     if sigma <= 0 or height < 3 or width < 3:
@@ -364,17 +333,7 @@ def soften_structure_edges(
     distance: np.ndarray | None = None,
     protect: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Attenuate residual in a wide band around coarse region borders.
-
-    A narrow dip only on the gradient ridge just moves DoG peaks *inside* the
-    box. This uses distance-to-edge with a smooth ramp of width ``exclude_px``
-    so the ringing band is suppressed too. ``strength <= 0`` or ``sigma <= 0``
-    leaves the residual unchanged.
-
-    ``protect`` is a boolean mask of compact residual islands that should
-    keep most of their residual even on a region border (large flakes, or
-    ≥20 µm debris on a *single* edge). Pad-corner L-junctions stay unmasked.
-    """
+    
     if strength <= 0 or sigma <= 0:
         return np.ascontiguousarray(residual, dtype=_FLOAT)
     if distance is None:
@@ -396,7 +355,7 @@ def _is_structure_outlier(
     size_ratio: float = _STRUCTURE_SIZE_RATIO,
     snr_ratio: float = _STRUCTURE_SNR_RATIO,
 ) -> bool:
-    """True if this blob is much larger (or higher SNR) than its neighbors."""
+    
     if neighbor_sizes.size:
         median_size = float(np.median(neighbor_sizes))
         if median_size > 0 and float(size) >= float(size_ratio) * median_size:
@@ -414,14 +373,7 @@ def reject_clustered_candidates(
     min_neighbors: int = 2,
     size_ratio: float = _STRUCTURE_SIZE_RATIO,
 ) -> list[ParticleCandidate]:
-    """Drop blobs that sit in a chain or grid of other blobs.
-
-    Isolated particles have no nearby hits. Region-border beads and repeating
-    layout cells have several neighbors within ``neighbor_px``. A blob that is
-    clearly larger or higher-SNR than those neighbors is kept (real flake in
-    a scatter of small layout nodes). ``neighbor_px`` or ``min_neighbors``
-    <= 0 disables the filter.
-    """
+    
     if neighbor_px <= 0 or min_neighbors <= 0 or len(candidates) < min_neighbors + 1:
         return candidates
     coords = np.array([[c.y_local, c.x_local] for c in candidates], dtype=np.float64)
@@ -455,14 +407,7 @@ def reject_axis_aligned_chains(
     max_gap: float = _STRUCTURE_LINE_MAX_GAP_PX,
     size_ratio: float = _STRUCTURE_SIZE_RATIO,
 ) -> list[ParticleCandidate]:
-    """Drop blobs that form a long horizontal or vertical row (box frames).
-
-    Isolated specks do not share a row/column with many others over a long
-    span. A blob that is clearly larger than the rest of the run is kept.
-    Runs with a hole larger than ``max_gap`` are not frames (two flakes can
-    share a 10 px row by chance). ``bin_px`` or ``min_run`` <= 0 disables
-    the filter. ``max_gap`` <= 0 skips the hole check.
-    """
+    
     if bin_px <= 0 or min_run <= 0 or len(candidates) < min_run:
         return candidates
     ys = np.array([c.y_local for c in candidates], dtype=np.float64)
@@ -501,7 +446,7 @@ def attach_neighbor_counts(
     candidates: list[ParticleCandidate],
     neighbor_px: float = NEIGHBOR_FEATURE_PX,
 ) -> list[ParticleCandidate]:
-    """Set ``n_neighbors_48`` from a spatial radius (does not drop blobs)."""
+    
     if not candidates:
         return candidates
     radius = float(neighbor_px) if neighbor_px > 0 else NEIGHBOR_FEATURE_PX
@@ -521,7 +466,7 @@ def _blob_window(
     radius: float,
     half: int | None = None,
 ) -> tuple[np.ndarray, int, int, int, int] | None:
-    """Patch around ``(y, x)`` and the peak's integer indices."""
+    
     height, width = image.shape
     span = int(half) if half is not None else max(int(np.ceil(3.0 * radius)), 4)
     span = max(span, 4)
@@ -541,11 +486,7 @@ def blob_support_area(
     radius: float,
     mass_fraction: float = _CIRCULARITY_MASS_FRACTION,
 ) -> float:
-    """Pixel count of the bright support around ``(y, x)``.
-
-    Plateaus and line segments fill most of the window; compact particles do
-    not. Used to drop layout pads that DoG reports at a small sigma.
-    """
+    
     window = _blob_window(residual, y, x, radius)
     if window is None:
         return 0.0
@@ -570,14 +511,8 @@ def blob_equivalent_diameter(
     bright: bool = True,
     half: int | None = None,
 ) -> float:
-    """Equivalent circular diameter (px) of the peak's connected footprint on the photo.
-
-    DoG ``sigma`` is a discrete search scale, not a measurement. Size is
-    ``2 √(A / π)`` where ``A`` is the 8-connected pixels that stand out from
-    the local photo background by ``mass_fraction`` of the peak contrast
-    (bright particles: ≥ bg + f×(peak−bg); dark: the inverse).
-    """
-    diameter_px, _edge = blob_footprint(
+    
+    return blob_footprint(
         image,
         y,
         x,
@@ -586,7 +521,6 @@ def blob_equivalent_diameter(
         bright=bright,
         half=half,
     )
-    return diameter_px
 
 
 def blob_footprint(
@@ -598,15 +532,11 @@ def blob_footprint(
     *,
     bright: bool = True,
     half: int | None = None,
-) -> tuple[float, list[np.ndarray]]:
-    """Diameter in pixels and the footprint edge in full-image ``(x, y)`` pixels.
-
-    The edge is the outline of the same connected area used for the diameter.
-    An empty edge means the click has no footprint.
-    """
+) -> float:
+    
     window = _blob_window(image, y, x, radius, half=half)
     if window is None:
-        return 0.0, []
+        return 0.0
     patch, iy, ix, y0, x0 = window
     height, width = image.shape
     cy_i = min(max(iy, 0), height - 1)
@@ -625,30 +555,25 @@ def blob_footprint(
     if bright:
         contrast = center - background
         if contrast <= 1e-12:
-            return 0.0, []
+            return 0.0
         thresh = background + float(mass_fraction) * contrast
         mask = (patch >= thresh).astype(np.uint8)
     else:
         contrast = background - center
         if contrast <= 1e-12:
-            return 0.0, []
+            return 0.0
         thresh = background - float(mass_fraction) * contrast
         mask = (patch <= thresh).astype(np.uint8)
     py = min(max(iy - y0, 0), mask.shape[0] - 1)
     px = min(max(ix - x0, 0), mask.shape[1] - 1)
     if mask[py, px] == 0:
-        return 0.0, []
+        return 0.0
     _n_labels, labels = cv2.connectedComponents(mask, connectivity=8)
-    component = (labels == labels[py, px]).astype(np.uint8)
+    component = labels == labels[py, px]
     area = float(np.count_nonzero(component))
     if area <= 0:
-        return 0.0, []
-    contours, _hierarchy = cv2.findContours(
-        component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
-    )
-    offset = np.array([[[int(x0), int(y0)]]], dtype=np.int32)
-    edge = [contour + offset for contour in contours]
-    return float(2.0 * np.sqrt(area / np.pi)), edge
+        return 0.0
+    return float(2.0 * np.sqrt(area / np.pi))
 
 
 def blob_local_peak_snr(
@@ -658,7 +583,7 @@ def blob_local_peak_snr(
     radius: float,
     bright: bool = True,
 ) -> float:
-    """Local peak SNR of ``(y, x)`` versus the patch median (MAD-scaled)."""
+    
     height, width = image.shape
     half = max(int(np.ceil(3.0 * radius)), 4)
     iy, ix = int(round(y)), int(round(x))
@@ -683,7 +608,7 @@ def blob_radial_means(
     x: float,
     radius: float,
 ) -> tuple[float, float, float]:
-    """Mean residual in rings ``≤0.5R``, ``0.5–1R``, and ``1–1.5R`` around the peak."""
+    
     window = _blob_window(residual, y, x, radius)
     if window is None:
         return 0.0, 0.0, 0.0
@@ -710,7 +635,7 @@ def blob_circularity(
     x: float,
     radius: float,
 ) -> float:
-    """Inertia-ratio circularity in ``[0, 1]`` (1 = round, 0 = line-like)."""
+    
     height, width = residual.shape
     half = max(int(np.ceil(3.0 * radius)), 4)
     iy, ix = int(round(y)), int(round(x))
@@ -757,13 +682,22 @@ def _size_bounds_px(config: dict[str, Any]) -> tuple[float, float]:
     return min_nm / pixel_size, max_nm / pixel_size
 
 
-def _blob_sigma_ratio(config: dict[str, Any], min_sigma: float, max_sigma: float) -> float:
+def blob_sigmas_for_size(
+    min_size_nm: float,
+    max_size_nm: float,
+    pixel_size_nm: float,
+) -> tuple[float, float]:
+    """DoG scales whose diameter (about 2.8 sigma) matches the size window."""
+    pixel = float(pixel_size_nm) if float(pixel_size_nm) > 0 else 1.0
+    min_sigma = max(float(min_size_nm) / pixel / _BLOB_DIAMETER_PER_SIGMA, 0.5)
+    max_sigma = max(float(max_size_nm) / pixel / _BLOB_DIAMETER_PER_SIGMA, min_sigma)
+    return min_sigma, max_sigma
+
+
+def _blob_sigma_ratio(config: dict[str, Any]) -> float:
     configured = cfg_get(config, "detection.blob_sigma_ratio", None)
     if configured is not None:
         return max(float(configured), 1.05)
-    num_sigma = int(cfg_get(config, "detection.blob_num_sigma", 5))
-    if max_sigma > min_sigma and num_sigma > 1:
-        return max(float((max_sigma / min_sigma) ** (1.0 / (num_sigma - 1))), 1.05)
     return 1.4
 
 
@@ -777,11 +711,7 @@ def _local_snr_sigma(config: dict[str, Any], max_sigma: float) -> float:
 def _snr_sigma_for_residual(
     config: dict[str, Any], max_sigma: float, used_tophat: bool
 ) -> float:
-    """Local SNR sigma for this residual. ``< 0`` disables. Top-hat skips auto SNR.
-
-    Top-hat is already a local-contrast map. Auto SNR on it boosts dark-field
-    noise into thousands of DoG hits, which then cluster-kill real particles.
-    """
+    
     configured = cfg_get(config, "detection.local_snr_sigma", None)
     if configured is not None and float(configured) < 0:
         return 0.0
@@ -795,11 +725,7 @@ def _probe_has_lattice(
     peak_threshold: float,
     notch_radius: int,
 ) -> bool:
-    """True if a full-resolution FFT notch is worth running.
-
-    Small tiles skip the probe (the real FFT is cheap). Large mixed-layout
-    tiles with no thumbnail peaks go straight to top-hat.
-    """
+    
     array = np.ascontiguousarray(image, dtype=_FLOAT)
     height, width = array.shape[:2]
     if min(height, width) <= _LATTICE_PROBE_MIN:
@@ -817,14 +743,7 @@ def _background_residual(
     config: dict[str, Any],
     fft_mask: np.ndarray | None,
 ) -> tuple[np.ndarray, bool]:
-    """Periodic-background residual and whether a morphological top-hat was used.
-
-    FFT on mixed-layout tiles often finds no lattice peaks (empty notch mask)
-    and would otherwise leave the raw image unchanged. In that case this
-    falls back to white top-hat so compact bright debris still stands out.
-    A cheap thumbnail FFT decides whether the full-resolution transform is
-    worth running.
-    """
+    
     method = str(cfg_get(config, "detection.method", "fft")).lower()
     tophat_radius = int(cfg_get(config, "detection.tophat_radius", 8))
     if method == "tophat":
@@ -851,7 +770,7 @@ def _background_residual(
 
 
 def _prune_overlapping_blobs(blobs: np.ndarray, overlap: float) -> np.ndarray:
-    """Drop the smaller-sigma blob when two circles overlap by more than ``overlap``."""
+    
     if blobs.shape[0] < 2 or overlap >= 1.0:
         return blobs
     radii = blobs[:, 2] * float(np.sqrt(2.0))
@@ -893,11 +812,7 @@ def blob_dog_fast(
     threshold: float = 0.08,
     overlap: float = 0.5,
 ) -> np.ndarray:
-    """Difference-of-Gaussians blobs, same scale convention as ``skimage.feature.blob_dog``.
-
-    Uses OpenCV Gaussians (large sigmas at reduced resolution) instead of
-    scikit-image's scipy filters. Returns ``(n, 3)`` array of ``(y, x, sigma)``.
-    """
+    
     array = np.ascontiguousarray(image, dtype=_FLOAT)
     if array.size == 0 or float(np.max(array)) < float(threshold):
         return np.empty((0, 3), dtype=np.float64)
@@ -951,12 +866,7 @@ def _orthogonal_image_junction(
     half: int = _ISLAND_JUNCTION_HALF_PX,
     min_frac: float = 0.55,
 ) -> bool:
-    """True if a long horizontal AND vertical intensity step meet near ``(y, x)``.
-
-    Pad corners are L-junctions of two box edges. A flake on a single scribe
-    or pad side has only one long run. Uses the preprocessed image, not the
-    skeletonized ridge (pad corners often sit tens of px inside that ridge).
-    """
+    
     iy, ix = int(round(y)), int(round(x))
     height, width = image.shape[:2]
     y0, y1 = max(iy - half, 0), min(iy + half + 1, height)
@@ -981,7 +891,7 @@ def _compact_island_protect(
     image: np.ndarray,
     config: dict[str, Any],
 ) -> np.ndarray:
-    """Boolean mask of compact residual islands to keep on layout ridges."""
+    
     pixel = float(cfg_get(config, "pixel_size_nm", 1.0) or 1.0)
     min_d = float(cfg_get(config, "detection.island_min_nm", _ISLAND_MIN_NM)) / pixel
     large_d = float(cfg_get(config, "detection.island_large_nm", _ISLAND_LARGE_NM)) / pixel
@@ -1022,7 +932,7 @@ def _compact_island_protect(
 
 
 def _island_seed_blobs(protect: np.ndarray) -> np.ndarray:
-    """DoG-scale seeds at centroids of protected islands (y, x, sigma)."""
+    
     if protect is None or not np.any(protect):
         return np.empty((0, 3), dtype=np.float64)
     n_labels, _labels, stats, centroids = cv2.connectedComponentsWithStats(
@@ -1041,26 +951,12 @@ def _island_seed_blobs(protect: np.ndarray) -> np.ndarray:
     return np.asarray(rows, dtype=np.float64)
 
 
-def compute_tile_residual(
-    image: np.ndarray,
-    config: dict[str, Any],
-    fft_mask: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return the corrected tile and the DoG residual, without blob finding.
-
-    Used by the unmarked-crop ML filter so training and inference see the
-    same residual the proposer uses. Circled label JPEGs are never read.
-    """
-    array, residual, _edge, _protect = _tile_residual_maps(image, config, fft_mask)
-    return array, residual
-
-
 def _tile_residual_maps(
     image: np.ndarray,
     config: dict[str, Any],
     fft_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray]:
-    """Corrected float image, residual, coarse edge-distance, island-protect mask."""
+    
     array = np.ascontiguousarray(image, dtype=_FLOAT)
     residual, used_tophat = _background_residual(array, config, fft_mask)
 
@@ -1102,36 +998,25 @@ def _residual_and_blobs(
     config: dict[str, Any],
     fft_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray, np.ndarray]:
-    """Preprocess residual and run DoG/LoG. ``blobs`` is ``(N, 3)`` y, x, sigma."""
+    
     array, residual, edge_distance, protect = _tile_residual_maps(
         image, config, fft_mask
     )
     min_sigma = float(cfg_get(config, "detection.blob_min_sigma", 1.0))
     max_sigma = float(cfg_get(config, "detection.blob_max_sigma", 8.0))
     threshold = float(cfg_get(config, "detection.blob_threshold", 0.025))
-    blob_method = str(cfg_get(config, "detection.blob_method", "dog")).lower()
     empty = np.empty((0, 3), dtype=np.float64)
     if float(np.max(residual)) < threshold:
         seeds = _island_seed_blobs(protect)
         return array, residual, edge_distance, seeds, protect
-    if blob_method == "log":
-        blobs = blob_log(
-            residual,
-            min_sigma=min_sigma,
-            max_sigma=max_sigma,
-            num_sigma=int(cfg_get(config, "detection.blob_num_sigma", 5)),
-            threshold=threshold,
-            overlap=0.5,
-        )
-    else:
-        blobs = blob_dog_fast(
-            residual,
-            min_sigma=min_sigma,
-            max_sigma=max_sigma,
-            sigma_ratio=_blob_sigma_ratio(config, min_sigma, max_sigma),
-            threshold=threshold,
-            overlap=0.5,
-        )
+    blobs = blob_dog_fast(
+        residual,
+        min_sigma=min_sigma,
+        max_sigma=max_sigma,
+        sigma_ratio=_blob_sigma_ratio(config),
+        threshold=threshold,
+        overlap=0.5,
+    )
     blobs = np.asarray(blobs, dtype=np.float64)
     seeds = _island_seed_blobs(protect)
     if seeds.size:
@@ -1153,7 +1038,7 @@ def _gate_blob(
     protect: np.ndarray | None = None,
     photo: np.ndarray | None = None,
 ) -> tuple[ParticleCandidate | None, str]:
-    """Return a candidate or the first gate that drops this DoG peak."""
+    
     min_d, max_d = _size_bounds_px(config)
     min_area = float(cfg_get(config, "detection.min_area_px", 4))
     min_circ = float(cfg_get(config, "detection.min_circularity", 0.0))
@@ -1236,17 +1121,12 @@ def _gate_blob(
     return candidate, "kept"
 
 
-def apply_structure_filters(
+def _structure_stages(
     candidates: list[ParticleCandidate],
     config: dict[str, Any],
-) -> list[ParticleCandidate]:
-    """Drop clustered / axis-aligned layout hits. Cluster rejection stays on.
-
-    Default pipeline order is gates → these filters → ML. ``structure_filters``
-    on ``detect_particles`` can skip this so a caller scores proposals first.
-    """
+) -> tuple[list[ParticleCandidate], list[ParticleCandidate]]:
     if not candidates:
-        return candidates
+        return [], []
     counted = attach_neighbor_counts(candidates, NEIGHBOR_FEATURE_PX)
     size_ratio = float(
         cfg_get(config, "detection.structure_size_ratio", _STRUCTURE_SIZE_RATIO)
@@ -1257,7 +1137,7 @@ def apply_structure_filters(
         int(cfg_get(config, "detection.structure_min_neighbors")),
         size_ratio=size_ratio,
     )
-    return reject_axis_aligned_chains(
+    chained = reject_axis_aligned_chains(
         clustered,
         bin_px=float(cfg_get(config, "detection.structure_line_bin_px", 10.0)),
         min_run=int(cfg_get(config, "detection.structure_line_min_run", 3)),
@@ -1267,6 +1147,17 @@ def apply_structure_filters(
         ),
         size_ratio=size_ratio,
     )
+    return clustered, chained
+
+
+def apply_structure_filters(
+    candidates: list[ParticleCandidate],
+    config: dict[str, Any],
+) -> list[ParticleCandidate]:
+    if not candidates:
+        return candidates
+    _clustered, chained = _structure_stages(candidates, config)
+    return chained
 
 
 def detect_particles(
@@ -1276,26 +1167,12 @@ def detect_particles(
     structure_filters: bool = True,
     photo: np.ndarray | None = None,
 ) -> list[ParticleCandidate]:
-    """Detect particle candidates on a single preprocessed tile.
-
-    Separates periodic structure (FFT notches, or white top-hat if the FFT
-    finds no lattice), keeps only compact high-prominence peaks, attenuates
-    coarse region borders (pad corners on the gradient ridge are never
-    kept; compact residual islands ≥20 µm on a *single* edge, or ≥40 µm
-    anywhere, are protected), then runs DoG blobs (LoG if ``blob_method``
-    is ``log``). Elongated and clustered layout hits are dropped when
-    ``structure_filters`` is true. Returns local pixel coordinates.
-
-    ``photo`` is the tile before preprocessing. The equivalent diameter and
-    the size gate use it. Peaks are still found on ``image``. Omit ``photo``
-    only when ``image`` is already the photograph to measure.
-    """
-    _array, residual, edge_distance, blobs, protect = _residual_and_blobs(
+    
+    array, residual, edge_distance, blobs, protect = _residual_and_blobs(
         image, config, fft_mask
     )
     if blobs.size == 0:
         return []
-    array = np.ascontiguousarray(image, dtype=_FLOAT)
     candidates: list[ParticleCandidate] = []
     for y, x, sigma in blobs:
         cand, _reason = _gate_blob(
@@ -1324,11 +1201,7 @@ def trace_locations(
     near_px: float = 20.0,
     photo: np.ndarray | None = None,
 ) -> list[dict[str, Any]]:
-    """Explain why each ``(y_local, x_local)`` is not a kept hit.
-
-    ``photo`` is the unprocessed tile, used for the size gate, matching
-    ``detect_particles``.
-    """
+    
     array, residual, edge_distance, blobs, protect = _residual_and_blobs(
         image, config, fft_mask
     )
@@ -1364,28 +1237,9 @@ def trace_locations(
                 )
             )
         gated_reasons.append(reason)
-    pre = attach_neighbor_counts(
-        [c for c, r in zip(gated, gated_reasons) if r == "kept"],
-        NEIGHBOR_FEATURE_PX,
-    )
-    size_ratio = float(
-        cfg_get(config, "detection.structure_size_ratio", _STRUCTURE_SIZE_RATIO)
-    )
-    clustered = reject_clustered_candidates(
-        pre,
-        float(cfg_get(config, "detection.structure_neighbor_px", 48.0)),
-        int(cfg_get(config, "detection.structure_min_neighbors")),
-        size_ratio=size_ratio,
-    )
-    chained = reject_axis_aligned_chains(
-        clustered,
-        bin_px=float(cfg_get(config, "detection.structure_line_bin_px", 10.0)),
-        min_run=int(cfg_get(config, "detection.structure_line_min_run", 3)),
-        min_span=float(cfg_get(config, "detection.structure_line_min_span_px", 48.0)),
-        max_gap=float(
-            cfg_get(config, "detection.structure_line_max_gap_px", _STRUCTURE_LINE_MAX_GAP_PX)
-        ),
-        size_ratio=size_ratio,
+    clustered, chained = _structure_stages(
+        [c for c, reason in zip(gated, gated_reasons) if reason == "kept"],
+        config,
     )
     chained_ids = {(c.x_local, c.y_local) for c in chained}
     clustered_ids = {(c.x_local, c.y_local) for c in clustered}

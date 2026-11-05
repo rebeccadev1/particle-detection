@@ -1,5 +1,3 @@
-"""Tests for N/S/E/W folder discovery and combined output size."""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -151,6 +149,29 @@ def test_orthogonal_2of4_rejects_opposite_pair() -> None:
     adjacent = np.stack([bright, dark, bright, dark], axis=0)
     adjacent_iso, _ = symmetry_signal_orthogonal_2of4(adjacent)
     assert float(adjacent_iso.mean()) > 0.5
+
+
+def test_combi_keeps_raw_gray_on_a_bright_pad(tmp_path: Path) -> None:
+    height, width = 80, 80
+    for name in ("N", "S", "E", "W"):
+        array = np.full((height, width), 40, dtype=np.uint8)
+        array[20:60, 20:60] = 180
+        array[38:42, 38:42] = 255
+        Image.fromarray(array).save(tmp_path / f"{name}.png")
+    sorted_stack, _sum, stack, gain = load_flattened_nsew(
+        tmp_path / "N.png",
+        tmp_path / "S.png",
+        tmp_path / "E.png",
+        tmp_path / "W.png",
+    )
+    assert gain == 1.0
+    assert float(stack[0, 40, 40]) == 255.0
+    assert float(stack[0, 30, 30]) == 180.0
+    isotropic, _sym = symmetry_signal_4way(sorted_stack, _sum, 3)
+    saved = scale_combi_uint8(isotropic, gain)
+    assert int(saved[40, 40]) == 255
+    assert int(saved[30, 30]) == 180
+    assert int(saved[5, 5]) == 40
 
 
 def test_scale_combi_uint8_keeps_a_flat_field_at_the_source_gray() -> None:

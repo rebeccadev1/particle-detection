@@ -23,18 +23,31 @@ On this GitHub page, click **Code**, then **Download ZIP**. Unzip it. The folder
 
 ## Install
 
-You need Python 3.11 or newer (3.13 is fine).
+You need 64-bit Python 3.11 or newer (3.13 and 3.14 are fine). The camera package needs macOS 14 or newer.
 
-On Mac: From this folder in your terminal, run:
+**Mac.** From this folder:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 pip install -r getting_started/requirements.txt
+python -m pip install --no-deps "Printrun==2.2.0"
 ```
 
-On Windows: Activate with `.venv\Scripts\activate` instead of `source .venv/bin/activate`.
+**Windows.** From this folder:
+
+```bat
+py -3 -m venv .venv
+.venv\Scripts\activate
+python -m pip install --upgrade pip
+pip install -r getting_started\requirements.txt
+python -m pip install --no-deps "Printrun==2.2.0"
+```
+
+Printrun is how Capture talks to the printer stage, the same library Pronterface uses. `--no-deps` keeps Pillow 10. A normal Printrun install on Windows asks for Pillow 9, and the summary PDF needs Pillow 10. If Pronterface is already installed with pipx, Capture finds that copy and this line can be skipped.
+
+On Windows, install the Basler pylon Camera Software Suite so the USB camera driver is present, and the WCH CH340 driver when Device Manager lists the Arduino or the printer as an unknown USB serial device. `pip` covers the Python packages. The drivers are separate installers.
 
 Tests need the extra packages in `getting_started/requirements-dev.txt`:
 
@@ -52,6 +65,8 @@ streamlit run app.py
 ```
 
 The browser opens on **Particle Detection** at <http://127.0.0.1:8502>. Leave the terminal running. Stop the app with Ctrl+C.
+
+Capture saves photos in an `Inputs` folder beside this project, and Analyse writes to `Outputs` beside it. A folder named `particle-detection` uses `../Inputs` and `../Outputs`.
 
 ## Starting the app
 

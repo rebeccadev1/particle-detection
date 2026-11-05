@@ -1,8 +1,8 @@
-"""Summary statistics and downsampled overlay images for reporting."""
 
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -32,7 +32,6 @@ SIZE_BIN_STEP_UM = 5.0
 NM_PER_UM = 1000.0
 
 def summary_stats(df: pd.DataFrame) -> dict[str, Any]:
-    """Return count and size-distribution summary for a particle table."""
     if df.empty:
         return {
             "particle_count": 0,
@@ -54,10 +53,6 @@ def particles_at_least(
     df: pd.DataFrame | None,
     thresholds_um: tuple[float, ...] = SIZE_COUNT_THRESHOLDS_UM,
 ) -> pd.DataFrame:
-    """One row per size: how many particles are at least that large.
-
-    ``size`` is equivalent circular diameter in nm.
-    """
     labels = [
         f"≥{int(threshold) if float(threshold).is_integer() else threshold} µm"
         for threshold in thresholds_um
@@ -74,11 +69,6 @@ def size_bin_edges(
     max_um: float,
     step_um: float = SIZE_BIN_STEP_UM,
 ) -> np.ndarray:
-    """``[min, min+step, ...]`` covering ``max_um``.
-
-    The last edge is the first step boundary at or above the largest size.
-    A size that lands on ``min`` still gets one bin.
-    """
     start = float(min_um)
     stop = max(float(max_um), start)
     step = float(step_um)
@@ -101,12 +91,7 @@ def size_distribution(
     min_um: float,
     step_um: float = SIZE_BIN_STEP_UM,
 ) -> pd.DataFrame:
-    """Particle counts in bins of ``step_um`` (5 µm) starting at ``min_um``.
 
-    ``size`` is equivalent circular diameter in nm. ``min_um`` is the minimum
-    size set for detection, not the smallest particle in the table. The first
-    bin is ``[min, min+5)``, then ``[min+5, min+10)``, through the largest size.
-    """
     if df is None or df.empty or "size" not in df.columns:
         edges = size_bin_edges(min_um, min_um, step_um)
         counts = np.zeros(len(edges) - 1, dtype=int)
@@ -123,14 +108,6 @@ def overlay_downsample(
     config: dict[str, Any],
     crop: tuple[int, int, int, int] | None = None,
 ) -> int:
-    """Pick the integer factor used to downsample tiles before stitching.
-
-    ``report.downsample`` > 0 is an explicit override. Otherwise the factor is
-    chosen so the stitched RGB overlay is about ``report.target_mb`` megabytes.
-    """
-    configured = int(cfg_get(config, "report.downsample", 0) or 0)
-    if configured > 0:
-        return configured
     if crop is None:
         height, width = mosaic.full_height, mosaic.full_width
     else:
@@ -144,11 +121,6 @@ def overlay_rgb(
     crop: tuple[int, int, int, int] | None = None,
     progress_cb: Callable[[int, int, str], None] | None = None,
 ) -> np.ndarray:
-    """Downsampled mosaic with no particle markers.
-
-    ``crop`` is ``(y, x, h, w)`` in full-resolution mosaic pixels. ``crop=None``
-    stitches every tile into one overview.
-    """
     downsample = overlay_downsample(mosaic, config, crop=crop)
     preview = mosaic.preview(downsample=downsample, crop=crop, progress_cb=progress_cb)
     return photo_display_rgb(preview)
@@ -162,15 +134,6 @@ def draw_overlay_markers(
     colors: Mapping[str, tuple[int, int, int]] | None = None,
     scale: float | None = None,
 ) -> np.ndarray:
-    """Copy ``rgb`` and draw circles on detected particles.
-
-    Marker positions are converted back to mosaic pixels using ``pixel_size_nm``.
-    ``crop`` is ``(y, x, h, w)`` in full-resolution mosaic pixels, matching the
-    crop used to build ``rgb``. Unlabeled hits stay orange. ``colors`` maps a
-    detection key to the review colour (green particle, red not a particle,
-    blue not sure). ``scale`` is display pixels per full-resolution mosaic
-    pixel; it overrides the downsample used when ``rgb`` is an already saved image.
-    """
     if particles.empty or np.asarray(rgb).size == 0:
         return rgb
 
@@ -213,12 +176,6 @@ def draw_overlay_markers(
     return marked
 
 def photo_display_rgb(image: np.ndarray) -> np.ndarray:
-    """RGB of a photograph at its saved gray levels.
-
-    An 8-bit tile stays as saved. A 0–1 float is scaled by 255. Wider counts
-    are scaled by their own maximum. There is no percentile stretch, which
-    was lifting dark microscope photos.
-    """
     array = np.asarray(image, dtype=np.float64)
     if array.size == 0:
         return np.zeros((0, 0, 3), dtype=np.uint8)
@@ -234,15 +191,10 @@ def photo_display_rgb(image: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
 
 
-def to_display_rgb(image: np.ndarray) -> np.ndarray:
-    """Display a photo at its saved gray levels. No contrast stretch."""
-    return photo_display_rgb(image)
-
 _DPI = 220.0
 _BASE_DPI = 150.0
 
 def _s(px: float) -> int:
-    """Scale a length chosen for the 150 dpi page."""
     return max(1, round(px * _DPI / _BASE_DPI))
 
 _PAGE_W = _s(1240)
@@ -262,13 +214,7 @@ def write_last_run_pdf(
     mosaic_plain: np.ndarray | None = None,
     unstitched: Sequence[tuple[str, np.ndarray, np.ndarray]] | None = None,
 ) -> Path:
-    """Write the run summary, size histogram, and mosaic or separate images.
 
-    When ``mosaic_plain`` is set, the mosaic page shows the marked image and
-    the same mosaic without markers beneath it. ``unstitched`` is
-    ``(filename, labeled rgb, plain rgb)`` for images whose names have no
-    grid pattern; each is placed on its own, not in the mosaic.
-    """
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     pages = _last_run_pages(table, config, mosaic_rgb, mosaic_plain, unstitched)
@@ -304,21 +250,30 @@ _FIGURE = round(13 * _PT_PX)
 _BODY = round(11 * _PT_PX)
 _LABEL = round(9 * _PT_PX)
 
+def _windows_fonts(*names: str) -> tuple[str, ...]:
+    windir = os.environ.get("WINDIR") or os.environ.get("SystemRoot") or r"C:\Windows"
+    folder = Path(windir) / "Fonts"
+    return tuple(str(folder / name) for name in names)
+
+
 _FONT_REGULAR = (
     "/System/Library/Fonts/Supplemental/Arial.ttf",
     "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
     "/Library/Fonts/Arial Unicode.ttf",
     "/Library/Fonts/Arial.ttf",
+    *_windows_fonts("arial.ttf"),
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
 )
 _FONT_BOLD = (
     "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    *_windows_fonts("arialbd.ttf"),
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
 )
 _FONT_ITALIC = (
     "/System/Library/Fonts/Supplemental/Arial Italic.ttf",
+    *_windows_fonts("ariali.ttf"),
     "/usr/share/fonts/truetype/liberation/LiberationSans-Italic.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
 )
@@ -352,7 +307,6 @@ def _italic_font(size: int) -> ImageFont.ImageFont:
     return _font(size)
 
 def summary_pdf_name(config: Mapping[str, Any]) -> str:
-    """``Summary of {input folder}.pdf``."""
     _path, folder = _input_path_and_folder(config)
     label = folder.strip() or "run"
     for char in '/\\:*?"<>|':
@@ -375,7 +329,6 @@ def _text_width(font: ImageFont.ImageFont, text: str) -> int:
     return int(box[2] - box[0])
 
 def _wrap_pil_text(text: str, font: ImageFont.ImageFont, max_w: int) -> list[str]:
-    """Break ``text`` so each line fits ``max_w``, preferring ``/`` and spaces."""
     if _text_width(font, text) <= max_w:
         return [text]
     lines: list[str] = []
@@ -464,7 +417,6 @@ def _count_table_edges(
     body: ImageFont.ImageFont,
     header: ImageFont.ImageFont,
 ) -> tuple[int, int]:
-    """Left and right of the size table, wide enough for the text only."""
     size_w = _text_width(header, "Size")
     count_w = _text_width(header, "Particles")
     for _, row in counts.iterrows():
@@ -529,7 +481,6 @@ def _paste_vertical(
     x: int,
     y: int,
 ) -> None:
-    """Draw ``text`` rotated so it reads upward beside the y-axis."""
     bbox = font.getbbox(text)
     width = int(bbox[2] - bbox[0]) + 4
     height = int(bbox[3] - bbox[1]) + 4
@@ -609,6 +560,20 @@ def _rgb_tile(mosaic_rgb: np.ndarray) -> Image.Image:
         rgb = cv2.cvtColor(rgb, cv2.COLOR_GRAY2RGB)
     return Image.fromarray(np.ascontiguousarray(rgb[:, :, :3].astype(np.uint8)), mode="RGB")
 
+def _paste_captioned(
+    page: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    y: int,
+    caption: str,
+    rgb: np.ndarray,
+    slot: int,
+    font: ImageFont.ImageFont,
+    caption_h: int,
+) -> int:
+    draw.text((_MARGIN, y), caption, fill=_MUTED, font=font)
+    return _paste_fitted(page, _rgb_tile(rgb), y + caption_h, slot)
+
+
 def _paste_fitted(page: Image.Image, tile: Image.Image, top: int, max_h: int) -> int:
     max_w = _PAGE_W - 2 * _MARGIN
     scale = min(max_w / tile.width, max_h / max(tile.height, 1), 1.0)
@@ -643,17 +608,16 @@ def _mosaic_page(
     gap = _s(28)
     available = _PAGE_H - y - _MARGIN - 2 * caption_h - gap
     slot = max(available // 2, 1)
-    draw.text((_MARGIN, y), "With labels", fill=_MUTED, font=_font(_BODY))
-    y += caption_h
-    y = _paste_fitted(image, _rgb_tile(mosaic_rgb), y, slot)
-    y += gap
-    draw.text((_MARGIN, y), "Without labels", fill=_MUTED, font=_font(_BODY))
-    y += caption_h
-    _paste_fitted(image, _rgb_tile(plain), y, slot)
+    body = _font(_BODY)
+    y = _paste_captioned(
+        image, draw, y, "With labels", mosaic_rgb, slot, body, caption_h
+    )
+    _paste_captioned(
+        image, draw, y + gap, "Without labels", plain, slot, body, caption_h
+    )
     return image
 
 def _filename_is_placeable(filename: str, pattern: str) -> bool:
-    """True when the name has row/column or x/y, so it can join the mosaic."""
     meta = try_parse_tile_filename(filename, pattern)
     if not meta:
         return False
@@ -662,12 +626,6 @@ def _filename_is_placeable(filename: str, pattern: str) -> bool:
     return "row" in meta and "col" in meta
 
 def unstitched_tile_paths(config: Mapping[str, Any]) -> list[Path]:
-    """Images detection ran that have no grid pattern.
-
-    Directional N/S/E/W shots are combined first and left out, the same way
-    the pipeline does. A combi with no row and column is shown on its own
-    page. Grid combis are stitched instead.
-    """
     folder = str(config.get("input_dir") or "").strip()
     if not folder:
         return []
@@ -699,11 +657,7 @@ def _particles_for_path(table: pd.DataFrame, path: Path) -> pd.DataFrame:
     return table.loc[mask]
 
 def _tile_preview_factor(height: int, width: int, config: Mapping[str, Any]) -> int:
-    """Downsample one loose tile. An explicit factor wins; otherwise cap the preview."""
     settings = dict(config)
-    configured = int(cfg_get(settings, "report.downsample", 0) or 0)
-    if configured > 0:
-        return configured
     target_mb = float(cfg_get(settings, "report.target_mb", 8.0))
     return downsample_for_target(
         height, width, target_mb=min(target_mb, 8.0), channels=3
@@ -715,7 +669,6 @@ def _draw_local_markers(
     config: Mapping[str, Any],
     downsample: int,
 ) -> np.ndarray:
-    """Orange circles for particles whose origin on this tile is the top-left."""
     if (
         particles.empty
         or np.asarray(rgb).size == 0
@@ -747,7 +700,6 @@ def unstitched_tile_pair(
     table: pd.DataFrame,
     config: Mapping[str, Any],
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Downsampled RGB of one loose image, with labels and without them."""
     tile_path = Path(path)
     image = load_tile_image(tile_path)
     factor = _tile_preview_factor(int(image.shape[0]), int(image.shape[1]), config)
@@ -765,7 +717,6 @@ def unstitched_tile_rgb(
     *,
     labels: bool = True,
 ) -> np.ndarray:
-    """Downsampled RGB of one image that is not part of the mosaic."""
     labeled, plain = unstitched_tile_pair(path, table, config)
     return labeled if labels else plain
 
@@ -773,7 +724,6 @@ def _unstitched_pages(
     tiles: Sequence[tuple[str, np.ndarray, np.ndarray]],
     folder: str = "",
 ) -> list[Image.Image]:
-    """Pages of images that were not stitched, with and without labels."""
     pages: list[Image.Image] = []
     image = Image.new("RGB", (_PAGE_W, _PAGE_H), "white")
     draw = ImageDraw.Draw(image)
@@ -799,24 +749,29 @@ def _unstitched_pages(
         slot = max((min(room, _s(900)) - 2 * label_h - gap) // 2, 1)
         plain = None if np.asarray(plain_rgb).size == 0 else plain_rgb
         if plain is None:
-            draw.text((_MARGIN, y), "With labels", fill=_MUTED, font=caption_font)
-            y += label_h
-            y = _paste_fitted(image, _rgb_tile(labeled_rgb), y, slot * 2)
+            y = _paste_captioned(
+                image, draw, y, "With labels", labeled_rgb, slot * 2, caption_font, label_h
+            )
         else:
-            draw.text((_MARGIN, y), "With labels", fill=_MUTED, font=caption_font)
-            y += label_h
-            y = _paste_fitted(image, _rgb_tile(labeled_rgb), y, slot)
-            y += gap
-            draw.text((_MARGIN, y), "Without labels", fill=_MUTED, font=caption_font)
-            y += label_h
-            y = _paste_fitted(image, _rgb_tile(plain), y, slot)
+            y = _paste_captioned(
+                image, draw, y, "With labels", labeled_rgb, slot, caption_font, label_h
+            )
+            y = _paste_captioned(
+                image,
+                draw,
+                y + gap,
+                "Without labels",
+                plain,
+                slot,
+                caption_font,
+                label_h,
+            )
         y += _s(28)
         first_on_page = False
     pages.append(image)
     return pages
 
 def encode_overlay_jpeg(rgb: np.ndarray, quality: int = 90) -> bytes:
-    """JPEG bytes for download; ``rgb`` is uint8 RGB."""
     bgr = cv2.cvtColor(np.asarray(rgb), cv2.COLOR_RGB2BGR)
     ok, buffer = cv2.imencode(
         ".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]

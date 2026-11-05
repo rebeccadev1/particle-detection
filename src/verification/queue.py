@@ -1,5 +1,3 @@
-"""Build the unlabeled review queue from detection CSVs."""
-
 from __future__ import annotations
 
 import json
@@ -67,29 +65,21 @@ def _set_id_from_tile(source_tile: str) -> str:
 
 
 def _set_nsew_aliases(set_id: str, x_nm: str, y_nm: str) -> set[str]:
-    """One field's N/S/E/W and its 2-of-4 detection share a key. Other fields do not."""
+    
     aliases = {f"{set_id}_NSEW_{x_nm}_{y_nm}", f"{set_id}_2of4_{x_nm}_{y_nm}"}
     aliases.update(f"{set_id}_{stem}_{x_nm}_{y_nm}" for stem in DIRECTION_STEMS)
     return aliases
 
 
 def _light_aliases(set_id: str, x_nm: str, y_nm: str) -> set[str]:
-    """One submap's four quads and its uniform ``all`` shot share a key."""
+    
     prefix = f"{set_id}_" if set_id else ""
     roles = ("LIGHT", *LIGHTING_ROLES)
     return {f"{prefix}{role}_{x_nm}_{y_nm}" for role in roles}
 
 
 def detection_key(row: Mapping[str, Any] | pd.Series) -> str:
-    """Stable id across runs: tile plus rounded global coordinates.
-
-    N/S/E/W and particles-only versions of the same location share one key
-    so a label on any of them applies to the others. A ``v1/N.bmp`` label
-    stays on that field (``v1_NSEW_…``) and is not mixed with ``v2``.
-
-    Groundup submaps do the same for ``quad0``–``quad3`` and ``all`` inside
-    one ``vN`` folder. ``v7`` is not mixed with ``v8``.
-    """
+    
     return _key_from_tile_xy(row["source_tile"], row["x_global"], row["y_global"])
 
 
@@ -112,20 +102,8 @@ def _key_from_tile_xy(source_tile: object, x_global: object, y_global: object) -
     return f"{Path(tile).stem}_{x_nm}_{y_nm}"
 
 
-def label_covers_uniform(key: object) -> bool:
-    """True when this key is the shared quad, combi, and uniform identity.
-
-    Letter N/S/E/W keys do not cover the uniform ``all`` shot.
-    """
-    text = str(key or "")
-    return (
-        _SET_LIGHT_KEY.fullmatch(text) is not None
-        or _LIGHT_KEY.fullmatch(text) is not None
-    )
-
-
 def nsew_key_aliases(key: str) -> set[str]:
-    """All keys that mean the same N/S/E/W / particles-only / submap lighting location."""
+    
     text = str(key)
     light_match = _SET_LIGHT_KEY.fullmatch(text)
     if light_match is not None:
@@ -147,7 +125,7 @@ def nsew_key_aliases(key: str) -> set[str]:
 
 
 def expand_labeled_keys(keys: Iterable[str]) -> set[str]:
-    """Union of each labeled key and its N/S/E/W aliases."""
+    
     expanded: set[str] = set()
     for key in keys:
         expanded.update(nsew_key_aliases(str(key)))
@@ -161,7 +139,7 @@ def _snap_family(
     merge_radius_nm: float,
     size_match_fraction: float,
 ) -> pd.DataFrame:
-    """Point family hits at the nearest labelled key inside the merge radius."""
+    
     if labels.empty or "x_global" not in labels.columns or not bool(det_mask.any()):
         return tagged
     lab_xy = labels[["x_global", "y_global"]].astype(float).to_numpy()
@@ -208,12 +186,12 @@ def _snap_family(
 
 
 def _uses_light_keys(source_tile: str) -> bool:
-    """Quads, the uniform shot, and a combi written beside them share LIGHT keys."""
+    
     return is_submap_lighting_tile(source_tile) or combi_key_family(source_tile) == "light"
 
 
 def _uses_nsew_keys(source_tile: str) -> bool:
-    """Letter directions and a combi written beside them share NSEW keys."""
+    
     return is_nsew_family_tile(source_tile) or combi_key_family(source_tile) == "nsew"
 
 
@@ -223,13 +201,7 @@ def snap_detection_keys_to_labels(
     merge_radius_nm: float,
     size_match_fraction: float = DEFAULT_NSEW_SIZE_MATCH_FRACTION,
 ) -> pd.DataFrame:
-    """Reuse a shared label key when a hit is at the same place.
-
-    Detector centroids rarely round to the exact labelled nanometre, so exact
-    key equality misses most transfers. Nearest labelled location within the
-    merge radius is treated as the same particle. Submap quads and the uniform
-    ``all`` shot snap only inside that ``vN`` folder.
-    """
+    
     if detections is None or detections.empty:
         return detections if detections is not None else pd.DataFrame()
     tagged = tagged_if_needed(detections).copy()
@@ -266,7 +238,7 @@ def snap_detection_keys_to_labels(
 
 
 def label_map_with_aliases(labels: pd.DataFrame | None) -> dict[str, str]:
-    """Map detection keys (and N/S/E/W aliases) onto stored labels."""
+    
     mapping: dict[str, str] = {}
     if labels is None or labels.empty or "key" not in labels.columns:
         return mapping
@@ -289,7 +261,7 @@ def label_map_with_aliases(labels: pd.DataFrame | None) -> dict[str, str]:
 
 
 def pipeline_particles_csv(config: Mapping[str, Any] | None = None) -> Path:
-    """``particles.csv`` written by Detection → Run pipeline."""
+    
     output_dir = None if config is None else cfg_get(dict(config), "output_dir", None)
     return resolve_output_dir(output_dir) / "particles.csv"
 
@@ -299,7 +271,7 @@ def write_last_pipeline(
     csv_path: str | Path,
     pointer_dir: str | Path | None = None,
 ) -> Path:
-    """Save this run's settings as ``last_pipeline.json`` inside the run folder."""
+    
     from src.overall.io.results_writer import write_run_settings
 
     del pointer_dir
@@ -315,12 +287,7 @@ def use_last_pipeline_queue(
     session_source: str | None,
     pipeline_csv: str | Path | None,
 ) -> bool:
-    """Use the latest pipeline CSV only after Load last run.
-
-    Opening Label used to fall back to ``allemaal 08/09/particles.csv``, the
-    old R3 review set, and then to whatever ``last_pipeline.json`` pointed at.
-    Neither loads until the session asks for the last run.
-    """
+    
     if pipeline_csv is None or not Path(pipeline_csv).is_file():
         return False
     return session_source == "last_pipeline"
@@ -344,7 +311,7 @@ def label_queue_is_cleared(
     csv_path: str | Path | None,
     pointer_dir: str | Path | None = None,
 ) -> bool:
-    """True when Empty queue dropped this exact results file."""
+    
     if csv_path is None:
         return False
     path = Path(csv_path)
@@ -372,7 +339,7 @@ def clear_label_queue(
     csv_path: str | Path,
     pointer_dir: str | Path | None = None,
 ) -> Path:
-    """Remember that this results file's unlabeled hits should not be shown."""
+    
     path = Path(csv_path)
     pointer = _label_queue_cleared_path(pointer_dir)
     pointer.parent.mkdir(parents=True, exist_ok=True)
@@ -381,12 +348,12 @@ def clear_label_queue(
 
 
 def restore_label_queue(pointer_dir: str | Path | None = None) -> None:
-    """Put a cleared Label queue back. A rewritten results file does this on its own."""
+    
     _label_queue_cleared_path(pointer_dir).unlink(missing_ok=True)
 
 
 def _newest_run_settings(folder: Path) -> Path | None:
-    """``last_pipeline.json`` in the run folder that was written most recently."""
+    
     if not folder.is_dir():
         return None
     newest: Path | None = None
@@ -415,12 +382,7 @@ def load_last_pipeline(
     config: Mapping[str, Any] | None = None,
     pointer_dir: str | Path | None = None,
 ) -> tuple[Path | None, dict[str, Any]]:
-    """CSV and run settings for the latest pipeline write.
-
-    Reads ``last_pipeline.json`` inside the newest run folder, then the
-    current ``output_dir`` ``particles.csv``. Does not use the labeling
-    recall table.
-    """
+    
     run_config: dict[str, Any] = dict(config or {})
     folder = Path(pointer_dir) if pointer_dir is not None else DEFAULT_OUTPUT_DIR
     pointer = _newest_run_settings(folder)
@@ -442,6 +404,14 @@ def load_last_pipeline(
                 value = payload.get(key)
                 if value not in (None, ""):
                     run_config[key] = value
+            saved_detection = payload.get("detection")
+            if isinstance(saved_detection, dict) and saved_detection.get("min_size_nm") not in (
+                None,
+                "",
+            ):
+                detection = dict(run_config.get("detection") or {})
+                detection["min_size_nm"] = float(saved_detection["min_size_nm"])
+                run_config["detection"] = detection
             if csv_path is not None and csv_path.is_file():
                 return csv_path, run_config
     csv_path = pipeline_particles_csv(run_config)
@@ -451,7 +421,7 @@ def load_last_pipeline(
 
 
 def load_particles_csv(path: str | Path) -> pd.DataFrame:
-    """Read a detector table and tag it with ``source_csv`` and ``key``."""
+    
     destination = Path(path)
     df = pd.read_csv(destination)
     for source, dest in (
@@ -471,14 +441,14 @@ def load_particles_csv(path: str | Path) -> pd.DataFrame:
 
 
 def filter_min_size(df: pd.DataFrame, min_size_nm: float = MIN_SIZE_NM) -> pd.DataFrame:
-    """Keep detections at least ``min_size_nm`` (default 10 µm)."""
+    
     if df.empty:
         return df.copy()
     return df.loc[df["size"].astype(float) >= float(min_size_nm)].reset_index(drop=True)
 
 
 def tag_table(df: pd.DataFrame, source_csv: str | Path | None = None) -> pd.DataFrame:
-    """Add ``key`` / ``source_csv`` to a pipeline table without mutating it."""
+    
     tagged = df.copy()
     if "source_csv" not in tagged.columns:
         tagged["source_csv"] = "" if source_csv is None else str(source_csv)
@@ -491,7 +461,7 @@ def tag_table(df: pd.DataFrame, source_csv: str | Path | None = None) -> pd.Data
 
 
 def merge_detection_tables(tables: Iterable[pd.DataFrame]) -> pd.DataFrame:
-    """Concatenate tables. Later rows update the same key; first-seen order is kept."""
+    
     merged: dict[str, dict[str, Any]] = {}
     order: list[str] = []
     for frame in tables:
@@ -527,11 +497,7 @@ def share_exposure_keys(
     merge_radius_nm: float,
     size_match_fraction: float = DEFAULT_NSEW_SIZE_MATCH_FRACTION,
 ) -> pd.DataFrame:
-    """Give nearby hits on two exposures of one field the same label key.
-
-    Both rows stay, so each exposure still draws the circle. ``exposure_keep``
-    is false on the partner row; the queue keeps the anchor only.
-    """
+    
     if detections is None or detections.empty:
         return detections if detections is not None else pd.DataFrame()
     pairs = EXPOSURE_FIELD_PAIRS.get(_exposure_folder_name(folder))
@@ -594,7 +560,7 @@ def unlabeled_queue(
     nsew_size_match_fraction: float = DEFAULT_NSEW_SIZE_MATCH_FRACTION,
     labels: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Detections at or above the size floor that are not yet in the label store."""
+    
     tables = [_drop_exposure_partners(frame) for frame in tables]
     merged = merge_detection_tables(tables)
     if merged.empty:
@@ -671,7 +637,7 @@ def _row_keys(frame: pd.DataFrame) -> list[str]:
 
 
 def _blank_text(value: object) -> str:
-    """``str(value or "")``. NaN is truthy, so it stays the text ``nan``."""
+    
     if value is None:
         return ""
     try:
@@ -691,11 +657,7 @@ def _join_stems(stems: set[str]) -> str:
 
 
 class _FamilyScan:
-    """One collapse family, indexed by picture so each merged hit scans its own rows.
-
-    Stems and label keys are computed once. The old loop rebuilt both from the
-    whole table for every merged particle.
-    """
+    
 
     def __init__(self, dirs: pd.DataFrame) -> None:
         self.x = dirs["x_global"].to_numpy(dtype=float)
@@ -759,10 +721,7 @@ def _dirs_kept_on_cluster(
     merge_radius_nm: float,
     size_match_fraction: float,
 ) -> str:
-    """Pictures this merged hit was found on, including ones already recorded.
-
-    A second pass must not drop ``ALL`` from a row whose saved file is the combi.
-    """
+    
     stems: set[str] = set()
     for part in str(particle.nsew_dirs or "").split(","):
         text = part.strip().upper()
@@ -798,11 +757,7 @@ def _labeled_key_on_cluster(
     size_match_fraction: float,
     expanded: set[str],
 ) -> str:
-    """Key to keep on a merged combi/uniform hit.
-
-    A label saved on either picture stays with the shared row. The key already
-    on the kept picture is used when neither picture was labeled.
-    """
+    
     stems = {
         part.strip().upper()
         for part in str(particle.nsew_dirs or "").split(",")
@@ -861,7 +816,7 @@ def _collapse_one_family(
     size_match_fraction: float,
     labeled_keys: set[str] | None = None,
 ) -> pd.DataFrame:
-    """One row per nearby location. At most one member per direction or lighting role."""
+    
     dirs = dirs.reset_index(drop=True)
     if dirs.empty:
         return dirs
@@ -917,7 +872,7 @@ def _collapse_one_family(
 
 
 def _shares_submap_review(source_tile: str) -> bool:
-    """Quads, the uniform shot, and the combi in the same ``vN`` folder."""
+    
     name = str(source_tile)
     if is_submap_lighting_tile(name):
         return True
@@ -926,17 +881,30 @@ def _shares_submap_review(source_tile: str) -> bool:
     return combi_key_family(name) == "light"
 
 
+def _collapse_lighting_groups(
+    tagged: pd.DataFrame,
+    lighting: pd.Series,
+    merge_radius_nm: float,
+    size_match_fraction: float,
+    known: set[str],
+) -> list[pd.DataFrame]:
+    if not bool(lighting.any()):
+        return []
+    subset = tagged.loc[lighting]
+    set_ids = subset["source_tile"].astype(str).map(submap_id)
+    return [
+        _collapse_one_family(group, merge_radius_nm, size_match_fraction, known)
+        for _, group in subset.groupby(set_ids, sort=False)
+    ]
+
+
 def collapse_submap_review_detections(
     df: pd.DataFrame | None,
     merge_radius_nm: float,
     size_match_fraction: float = DEFAULT_NSEW_SIZE_MATCH_FRACTION,
     labeled_keys: Iterable[str] | None = None,
 ) -> pd.DataFrame | None:
-    """One row when the combi and the uniform shot are the same particle.
-
-    The kept id is shared. ``nsew_dirs`` still lists every picture it was found
-    on, so the summary can draw that id on each of those pictures.
-    """
+    
     if df is None or df.empty or "source_tile" not in df.columns:
         return df
     tagged = tagged_if_needed(df)
@@ -944,14 +912,13 @@ def collapse_submap_review_detections(
     lighting = tiles.map(_shares_submap_review)
     if not bool(lighting.any()):
         return tagged.reset_index(drop=True)
-    frames: list[pd.DataFrame] = [tagged.loc[~lighting].copy()]
-    subset = tagged.loc[lighting]
-    set_ids = subset["source_tile"].astype(str).map(submap_id)
     known = set() if labeled_keys is None else {str(key) for key in labeled_keys}
-    for _, group in subset.groupby(set_ids, sort=False):
-        frames.append(
-            _collapse_one_family(group, merge_radius_nm, size_match_fraction, known)
+    frames: list[pd.DataFrame] = [tagged.loc[~lighting].copy()]
+    frames.extend(
+        _collapse_lighting_groups(
+            tagged, lighting, merge_radius_nm, size_match_fraction, known
         )
+    )
     nonempty = [frame for frame in frames if frame is not None and not frame.empty]
     if not nonempty:
         return tagged.iloc[0:0].reset_index(drop=True)
@@ -964,11 +931,7 @@ def collapse_nsew_detections(
     size_match_fraction: float = DEFAULT_NSEW_SIZE_MATCH_FRACTION,
     labeled_keys: Iterable[str] | None = None,
 ) -> pd.DataFrame:
-    """Keep one row per shared location so Tinder does not ask once per lighting shot.
-
-    N/S/E/W and particles-only share globally. Submap quads, the uniform
-    ``all`` shot, and the combi beside them share only inside the same ``vN`` folder.
-    """
+    
     if df is None or df.empty or "source_tile" not in df.columns:
         return df
     tagged = tagged_if_needed(df)
@@ -985,13 +948,11 @@ def collapse_nsew_detections(
                 tagged.loc[direction], merge_radius_nm, size_match_fraction, known
             )
         )
-    if lighting.any():
-        subset = tagged.loc[lighting]
-        set_ids = subset["source_tile"].astype(str).map(submap_id)
-        for _, group in subset.groupby(set_ids, sort=False):
-            frames.append(
-                _collapse_one_family(group, merge_radius_nm, size_match_fraction, known)
-            )
+    frames.extend(
+        _collapse_lighting_groups(
+            tagged, lighting, merge_radius_nm, size_match_fraction, known
+        )
+    )
     nonempty = [frame for frame in frames if frame is not None and not frame.empty]
     if not nonempty:
         return tagged.iloc[0:0].reset_index(drop=True)

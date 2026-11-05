@@ -1,5 +1,3 @@
-"""Load and access nested pipeline configuration."""
-
 from __future__ import annotations
 
 import re
@@ -18,11 +16,7 @@ DEFAULT_INPUT_DIR = WORKSPACE_ROOT / "Inputs"
 
 
 def resolve_output_dir(folder: str | Path | None = None) -> Path:
-    """Map ``output_dir`` onto ``ASML SE/Outputs`` unless an absolute path is given.
-
-    Bare names such as ``Single v6`` become ``Outputs/Single v6``. Relative
-    paths that start with ``.`` or ``..`` are resolved from the project folder.
-    """
+    
     text = str(folder or "").strip().strip('"').strip("'")
     if not text:
         return DEFAULT_OUTPUT_DIR
@@ -39,12 +33,7 @@ def next_versioned_output_name(
     input_folder: str | Path | None,
     outputs: str | Path | None = None,
 ) -> str:
-    """``{input folder name} vN`` under Outputs, one past the highest existing match.
-
-    ``Groundup/Groundup v7 (06-10)`` becomes ``Groundup v7 (06-10) v1`` when
-    that folder is missing, and ``v2`` when ``v1`` already exists. An empty
-    input returns ``""``.
-    """
+    
     text = str(input_folder or "").strip().strip('"').strip("'").rstrip("/\\")
     if not text:
         return ""
@@ -65,12 +54,7 @@ def advance_versioned_output_name(
     current: str | Path | None,
     outputs: str | Path | None = None,
 ) -> str:
-    """``{input folder} vN`` one past the version a run just used.
-
-    ``current`` is the output folder of that run. A blank current is treated
-    as the next free version, then moved one further. A name that is not
-    ``{input folder} vN`` is left unchanged.
-    """
+    
     fresh = next_versioned_output_name(input_folder, outputs)
     label = output_choice_label(current).strip()
     if not fresh:
@@ -88,11 +72,48 @@ def advance_versioned_output_name(
     return f"{name} v{max(fresh_n, used_n + 1)}"
 
 
-def output_choice_label(folder: str | Path | None) -> str:
-    """Folder name under Outputs, or the original text when it points elsewhere.
+def reserve_fresh_output_dir(config: dict[str, Any]) -> Path:
+    chosen = str(cfg_get(config, "output_dir", "") or "").strip()
+    if not chosen:
+        return resolve_output_dir(None)
+    dest = resolve_output_dir(chosen)
+    if not dest.exists():
+        return dest
+    fresh = _next_free_output_path(config, dest)
+    config["output_dir"] = _output_dir_config_value(chosen, fresh)
+    return fresh
 
-    ``../Outputs/Single v7`` and ``Single v7`` are the same suggestion.
-    """
+
+def _next_free_output_path(config: dict[str, Any], occupied: Path) -> Path:
+    root = occupied.parent
+    fresh = next_versioned_output_name(cfg_get(config, "input_dir", ""), root)
+    if fresh:
+        candidate = root / fresh
+        if candidate != occupied and not candidate.exists():
+            return candidate
+    match = re.fullmatch(r"(?P<base>.*) v(?P<n>\d+)", occupied.name)
+    if match:
+        base = match.group("base")
+        number = int(match.group("n")) + 1
+    else:
+        base = occupied.name
+        number = 2
+    while True:
+        candidate = root / f"{base} v{number}"
+        if not candidate.exists():
+            return candidate
+        number += 1
+
+
+def _output_dir_config_value(chosen: str, path: Path) -> str:
+    raw = Path(chosen.strip().strip('"').strip("'"))
+    if raw.is_absolute() or (raw.parts and raw.parts[0] in (".", "..")):
+        return str(path)
+    return path.name
+
+
+def output_choice_label(folder: str | Path | None) -> str:
+    
     text = str(folder or "").strip().strip('"').strip("'")
     if not text:
         return ""
@@ -107,10 +128,7 @@ def output_choice_label(folder: str | Path | None) -> str:
 
 
 def output_folder_labels(root: str | Path | None = None) -> list[str]:
-    """Top-level folder names under Outputs.
-
-    A typed name such as ``Single v7`` is created under ``ASML SE/Outputs``.
-    """
+    
     base = DEFAULT_OUTPUT_DIR if root is None else Path(root)
     if not base.is_dir():
         return []
@@ -128,10 +146,7 @@ def output_folder_choices(
     standard: str | None,
     root: str | Path | None = None,
 ) -> list[str]:
-    """Existing output folders, plus the current value and the standard name.
-
-    The standard name is ``{tile folder} vN`` and may not exist yet.
-    """
+    
     choices = output_folder_labels(root)
     for name in (output_choice_label(current), str(standard or "").strip()):
         if name and name not in choices:
@@ -140,7 +155,7 @@ def output_folder_choices(
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
-    """Read a YAML config file into a nested dictionary."""
+    
     with Path(path).open("r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle)
     if not isinstance(data, dict):
@@ -149,7 +164,7 @@ def load_config(path: str | Path) -> dict[str, Any]:
 
 
 def cfg_get(config: dict[str, Any], dotted_key: str, default: Any = None) -> Any:
-    """Fetch a nested value using dotted keys, e.g. ``detection.method``."""
+    
     current: Any = config
     for part in dotted_key.split("."):
         if not isinstance(current, dict) or part not in current:
@@ -159,7 +174,7 @@ def cfg_get(config: dict[str, Any], dotted_key: str, default: Any = None) -> Any
 
 
 def deep_update(base: dict[str, Any], overlay: dict[str, Any] | None) -> dict[str, Any]:
-    """Copy ``base`` and recursively overlay mapping values from ``overlay``."""
+    
     out = deepcopy(base)
     if not overlay:
         return out
@@ -173,14 +188,14 @@ def deep_update(base: dict[str, Any], overlay: dict[str, Any] | None) -> dict[st
 
 
 def nsew_config_path(path: str | Path | None = None) -> Path:
-    """``nsew_config.yaml`` next to ``config.yaml`` unless ``path`` is given."""
+    
     if path is not None:
         return Path(path)
     return CONFIG_DIR / "nsew_config.yaml"
 
 
 def load_nsew_overlay(path: str | Path | None = None) -> dict[str, Any]:
-    """Read Groundup / N/S/E/W standard values, or ``{}`` when the file is missing."""
+    
     destination = nsew_config_path(path)
     if not destination.is_file():
         return {}
@@ -194,7 +209,7 @@ def apply_nsew_settings(
     overlay: dict[str, Any] | None = None,
     path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Return ``config`` with N/S/E/W standard values merged on top."""
+    
     profile = overlay if overlay is not None else load_nsew_overlay(path)
     if not profile:
         profile = (config.get("nsew_profile") or {}) if isinstance(config, dict) else {}
@@ -202,11 +217,7 @@ def apply_nsew_settings(
 
 
 def beta_preset_rows(config: dict[str, Any]) -> list[dict[str, Any]]:
-    """Normalized ``report.beta_presets`` rows: beta, model_path, threshold.
-
-    Raises ``ValueError`` when the list is missing, a row is incomplete, or
-    the same beta appears twice.
-    """
+    
     raw = cfg_get(config, "report.beta_presets", None)
     if not isinstance(raw, list) or not raw:
         raise ValueError(
@@ -243,10 +254,7 @@ def beta_preset_rows(config: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def preset_for_beta(presets: list[dict[str, Any]], beta: float) -> dict[str, Any]:
-    """Return the model path and threshold for ``beta``.
-
-    Unknown betas raise ``ValueError`` instead of falling back to another model.
-    """
+    
     try:
         target = round(float(beta), 2)
     except (TypeError, ValueError) as exc:
@@ -260,3 +268,16 @@ def preset_for_beta(presets: list[dict[str, Any]], beta: float) -> dict[str, Any
             }
     known = ", ".join(f"{float(row['beta']):.2f}" for row in presets) or "(none)"
     raise ValueError(f"No ML preset for beta {target:.2f}. Known betas: {known}.")
+
+
+def apply_beta_ml(config: dict[str, Any]) -> dict[str, Any]:
+    """Point the run's classifier at the model and threshold for report.f_beta."""
+    raw = cfg_get(config, "report.beta_presets", None)
+    if not isinstance(raw, list) or not raw:
+        return config
+    beta = cfg_get(config, "report.f_beta", 1.0)
+    preset = preset_for_beta(beta_preset_rows(config), 1.0 if beta is None else beta)
+    ml = config.setdefault("ml", {})
+    ml["model_path"] = preset["model_path"]
+    ml["threshold"] = preset["threshold"]
+    return config

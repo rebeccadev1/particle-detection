@@ -48,7 +48,7 @@ def downsample_for_target(
 def _load_downsampled(path: Path, factor: int) -> np.ndarray:
     """Read one tile and shrink it. The full-resolution array is discarded."""
     image = np.asarray(load_tile_image(path), dtype=np.float32)
-    return _downsample(image, factor)
+    return downsample_image(image, factor)
 
 
 def _paste(canvas: np.ndarray, small: np.ndarray, y: int, x: int) -> None:
@@ -180,7 +180,7 @@ class LazyMosaic:
                 continue
             image = np.asarray(load_tile_image(placement.path), dtype=np.float32)
             patch = image[oy0 - ty0 : oy1 - ty0, ox0 - tx0 : ox1 - tx0]
-            small = _downsample(patch, factor)
+            small = downsample_image(patch, factor)
             _paste(canvas, small, (oy0 - y0) // factor, (ox0 - x0) // factor)
             if progress_cb is not None:
                 progress_cb(index, total, placement.name)
@@ -195,7 +195,3 @@ def downsample_image(image: np.ndarray, factor: int) -> np.ndarray:
     h, w = array.shape[:2]
     nh, nw = max(h // factor, 1), max(w // factor, 1)
     return cv2.resize(array, (nw, nh), interpolation=cv2.INTER_AREA)
-
-
-def _downsample(image: np.ndarray, factor: int) -> np.ndarray:
-    return downsample_image(image, factor)
